@@ -1,4 +1,6 @@
-### Hi there 👋
+### Parth Nobel
+
+I'm currently at Stanford University working on a PhD in optimization with [cvxgrp](https://github.com/cvxgrp)!
 
 <!--
 **PTNobel/PTNobel** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
