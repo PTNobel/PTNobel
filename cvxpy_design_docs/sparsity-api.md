@@ -2,7 +2,8 @@
 
 Author: Parth Nobel  
 Target Audience: William + CVXPY Maintainers  
-Date: November 18, 2024
+Date: November 18, 2024  
+Conclusion: Accepted with option 3.
 
 This doc considers miscellaneous options around how to have more ergonomic support for sparse variables in CVXPY.
 
