@@ -1,6 +1,6 @@
 ### Parth Nobel
 
-I'm currently at Stanford University working on a PhD in optimization! See [my website](https://ptnobel.github.io) for more details!
+See [my website](https://ptnobel.github.io) for more details!
 
 <!--
 **PTNobel/PTNobel** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
