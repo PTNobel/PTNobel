@@ -34,7 +34,7 @@ solver-specific inputs. Every solver has a different convention:
 
 | Solver   | Form                                                       | Canonical params      |
 |----------|------------------------------------------------------------|-----------------------|
-| SCS      | min. $c^\top x$ s.t. $Ax + s = b,s \in K$              | $P, c, d, A, b$       |
+| SCS      | min. $\tfrac{1}{2}x^\top Px + c^\top x$ s.t. $Ax + s = b,s \in K$ | $P, c, d, A, b$ |
 | Clarabel | min. $\tfrac{1}{2}x^\top Px + q^\top x$ s.t. $Ax + s = b,s \in K$ | $P, q, d, A, b$ |
 | ECOS     | min. $c^\top x$ s.t. $Ax = b,Gx \le h$                 | $c, d, A, b, G, h$    |
 | OSQP     | min. $\tfrac{1}{2}x^\top Px + q^\top x$ s.t. $l \le Ax \le u$ | $P, q, d, A, l, u$ |
