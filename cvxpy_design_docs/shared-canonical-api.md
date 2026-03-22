@@ -276,8 +276,11 @@ class ConicSolver(Solver):
         Recovery maps: builds sparse matrices that map the solver's
         flat primal/dual vectors to per-variable/per-constraint values,
         with svec unpacking and scaling baked in.
+
+        Returns NotImplemented for solvers that have not yet
+        implemented this API.
         """
-        ...
+        return NotImplemented
 ```
 
 Map dictionary keys use whatever name the solver uses for each
@@ -536,10 +539,14 @@ maps to do the matmul in its own tensor framework).
 
 ## Open Questions
 
-1. **Should `get_canonical_maps()` be cached?** No. Neither CVXPYgen
-   nor CVXPYlayers will query the same problem for maps more than once,
-   and the underlying `ParamConeProg` is already cached. Adding a
-   separate cache for the maps would be complexity for no benefit.
+1. **Should `get_canonical_maps()` be cached?** Yes, if CVXPY
+   migrates its own solve path to use canonical maps (see Future Work).
+   Caching the result lets CVXPY check whether the solver returned
+   `NotImplemented` or a real `CanonicalMaps` and use that to decide
+   whether to take the new maps path or fall back to the old `apply()`
+   path — without recomputing the maps on every solve. For the
+   initial external-only use case (CVXPYgen, CVXPYlayers), caching is
+   not strictly necessary since those libraries query once.
 
 2. **Relationship with `apply_param_jac()`**: CVXPY's `backward()`
    uses `apply_param_jac()`, which computes `M.T @ dvalues` — the
@@ -573,3 +580,19 @@ maps to do the matmul in its own tensor framework).
    separate t and x duals), while CVXPYlayers uses per-dual-variable
    entries. These conventions differ — we should pick one and make the
    shared API consistent.
+
+## Future Work
+
+CVXPY's own solver `apply()` path currently duplicates much of the
+same sign-correction and splitting logic that `get_canonical_maps()`
+would formalize. In the long term, CVXPY could migrate its internal
+`apply_parameters()` + solver `apply()` path to use the same
+`CanonicalMaps` infrastructure. Since the base `get_canonical_maps()`
+returns `NotImplemented`, CVXPY can incrementally adopt this: for
+solvers that return a real `CanonicalMaps`, use the maps path
+(evaluate the affine maps to produce solver inputs); for solvers
+that return `NotImplemented`, fall back to the existing `apply()`
+path. This lets solvers migrate one at a time without breaking
+anything, and eventually makes the canonical maps the single source
+of truth for parameter-to-solver-input conversion across CVXPY,
+CVXPYgen, and CVXPYlayers.
