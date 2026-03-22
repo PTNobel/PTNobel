@@ -536,16 +536,18 @@ maps to do the matmul in its own tensor framework).
 
 ## Open Questions
 
-1. **Should `get_canonical_maps()` be cached?** Probably yes, since the
-   maps are static for a given solver + problem. The `ParamConeProg`
-   is already cached; the compiled maps could be cached alongside it.
+1. **Should `get_canonical_maps()` be cached?** No. Neither CVXPYgen
+   nor CVXPYlayers will query the same problem for maps more than once,
+   and the underlying `ParamConeProg` is already cached. Adding a
+   separate cache for the maps would be complexity for no benefit.
 
-2. **Should the API support the gradient/backward use case?** CVXPY's
-   `backward()` uses `apply_param_jac()`, which is the transpose of
-   the parameter mapping. The compiled maps could provide this too:
-   `map.T @ dvalues = dparam_vec`. This would simplify CVXPY's own
-   backward path and could be useful for CVXPYlayers' derivative
-   computation.
+2. **Relationship with `apply_param_jac()`**: CVXPY's `backward()`
+   uses `apply_param_jac()`, which computes `M.T @ dvalues` — the
+   transpose of the same parameter mapping that `get_canonical_maps()`
+   exposes as `M`. Either `apply_param_jac()` should be simplified to
+   use the maps from `get_canonical_maps()` internally, or both should
+   share a common interface for constructing the per-solver-parameter
+   affine maps so the logic isn't duplicated.
 
 3. **Naming**: `get_canonical_maps()` vs `get_compiled_maps()`
    vs `compile_param_maps()` vs something else?
@@ -558,14 +560,16 @@ maps to do the matmul in its own tensor framework).
    user-facing format and the overhead is minimal.)
 
 5. **CVXPYgen dual recovery migration**: CVXPYgen currently traces
-   `inverse_data[-1..-4]` for dual recovery. With `R_dual`, it would
-   instead generate C code for a single sparse matmul. Does CVXPYgen
-   need anything beyond `R_dual` and `DualInfo` for its codegen, or
-   does it also use the `inverse_data` chain for primal variable
-   recovery? (Primal recovery via `R_primal` should cover that case.)
+   `inverse_data[-1..-4]` for dual recovery and also uses
+   `inverse_data` for primal variable recovery. `R_primal` and
+   `R_dual` (plus `VarInfo` / `DualInfo` metadata) should cover both
+   cases, replacing the fragile index-based `inverse_data` tracing
+   entirely. (Confirmed with Max Schaller.)
 
 6. **Multi-dual constraints**: SOC has 2 dual variables, ExpCone has 3.
    The `R_dual` / `DualInfo` design handles this by having one
-   `DualInfo` entry per dual variable (not per constraint). Does
-   CVXPYgen expose multi-dual constraints, or only one dual per
-   constraint?
+   `DualInfo` entry per dual variable (not per constraint). CVXPYgen
+   exposes one dual per constraint (a single vector for SOC, not
+   separate t and x duals), while CVXPYlayers uses per-dual-variable
+   entries. These conventions differ — we should pick one and make the
+   shared API consistent.
