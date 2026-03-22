@@ -32,12 +32,12 @@ reduced_A.reduced_mat @ param_vec  -->  values of augmented [A | b] (CSC-ordered
 Both libraries then need to go from these raw data vectors to
 solver-specific inputs. Every solver has a different convention:
 
-| Solver   | Form                                     | Canonical params      |
-|----------|------------------------------------------|-----------------------|
-| SCS      | min c'x s.t. Ax+s=b, s in K             | P, c, d, A, b         |
-| Clarabel | min (1/2)x'Px+q'x s.t. Ax+s=b, s in K   | P, q, d, A, b         |
-| ECOS     | min c'x s.t. Ax=b, Gx<=h                | c, d, A, b, G, h      |
-| OSQP     | min (1/2)x'Px+q'x s.t. l<=Ax<=u         | P, q, d, A, l, u      |
+| Solver   | Form                                                       | Canonical params      |
+|----------|------------------------------------------------------------|-----------------------|
+| SCS      | $\min.\ c^\top x$ s.t. $Ax + s = b,\; s \in K$              | $P, c, d, A, b$       |
+| Clarabel | $\min.\ \tfrac{1}{2}x^\top Px + q^\top x$ s.t. $Ax + s = b,\; s \in K$ | $P, q, d, A, b$ |
+| ECOS     | $\min.\ c^\top x$ s.t. $Ax = b,\; Gx \le h$                 | $c, d, A, b, G, h$    |
+| OSQP     | $\min.\ \tfrac{1}{2}x^\top Px + q^\top x$ s.t. $l \le Ax \le u$ | $P, q, d, A, l, u$ |
 
 The conversion from the raw `ParamConeProg` tensors to these
 solver-specific parameters involves:
@@ -120,9 +120,9 @@ Both primal and dual recovery are purely linear:
 
 | Recovery step | Operation | Matrix representation |
 |---|---|---|
-| Variable slicing | `x[offset:offset+size]` | Rows of identity (selection) |
-| Symmetric unpacking | Upper-tri → full matrix | Sparse matrix with 0/1 entries |
-| PSD dual svec unpacking | Scale off-diag by 1/sqrt(2), expand | Sparse matrix with 1 and 1/sqrt(2) entries |
+| Variable slicing | $x[\text{offset}:\text{offset}+\text{size}]$ | Rows of identity (selection) |
+| Symmetric unpacking | Upper-tri $\to$ full matrix | Sparse matrix with $0/1$ entries |
+| PSD dual svec unpacking | Scale off-diag by $1/\sqrt{2}$, expand | Sparse matrix with $1$ and $1/\sqrt{2}$ entries |
 | Multi-dual offset | Slice within constraint dual | Row selection |
 | Fortran reshape | Column-major reordering | Permutation matrix |
 
