@@ -70,22 +70,9 @@ and produces a per-parameter affine map:
 `p_id_to_mapping[p_id] @ param_vec = canonical_param_values`. This is
 the core logic that could be upstreamed.
 
-**In CVXPYlayers** (v1.0.3, master): CSC-to-CSR conversion has been
-centralized into `solver_utils.py` (`convert_to_csr()`), and the row
-permutation is applied once during `get_solver_ctx()` in
-`interfaces/__init__.py`. Each solver interface still independently
-reconstructs the augmented `[A | b]` matrix, splits off `b`, negates
-`A`, and converts to the solver's preferred format, but the CSC-to-CSR
-permutation no longer happens at forward time. Instead, `param_prob`'s
-`reduced_A.reduced_mat` and `reduced_P.reduced_mat` are pre-permuted
-so that `matrix @ params` produces values directly in CSR order.
-
-Additional recent changes on master:
-- **scipy sparse matmul** for CPU (80-200x faster than torch sparse CSR)
-- **`solve_only_batch()`** for DIFFCP when gradients aren't needed
-- **warm-start** support for Moreau solver
-- **parametric `quad_form(x, P)`** via `quad_form_dpp_scope()`
-- **full dual variable support** (see Dual Variable Recovery below)
+**In CVXPYlayers**: Each solver interface independently reconstructs
+the augmented `[A | b]` matrix, splits off `b`, negates `A`, and
+converts to the solver's preferred format at forward-pass time.
 
 ### The Duplication
 
@@ -339,58 +326,14 @@ keeps its sparsity optimization, adjacency tracking, and C codegen.
 
 ### CVXPYlayers
 
-CVXPYlayers' entire `_recover_results()` function — with its
-`if/elif` dispatch on `unpack_fn`, `_unpack_primal_svec()`,
-`_unpack_svec()`, `_reshape_fortran()`, `_svec_to_symmetric()` —
-would become a single sparse matmul:
-
-```python
-# Current: ~100 lines of recovery logic per framework
-for var in ctx.var_recover:
-    if var.source == "primal":
-        data = primal[..., var.primal]
-    else:
-        data = dual[..., var.dual]
-    if var.unpack_fn == "svec_primal":
-        result = _unpack_primal_svec(data, var.shape[0], batch)
-    elif var.unpack_fn == "svec_dual":
-        result = _unpack_svec(data, var.shape[0], batch)
-    elif var.unpack_fn == "reshape":
-        result = _reshape_fortran(data, batch + var.shape)
-    ...
-
-# Proposed: one sparse matmul + reshape
-primal_flat = self.R_primal_torch @ solver_x   # all vars at once
-dual_flat = self.R_dual_torch @ solver_y       # all duals at once
-# Split into per-variable tensors using VarInfo/DualInfo offsets
-results = [
-    primal_flat[..., vi.offset:vi.offset+vi.size].reshape(vi.shape)
-    for vi in canon.primal_vars
-]
-```
-
-Key simplifications:
-
-1. **Unified recovery path.** No per-cone-type dispatch. The sparse
-   matrix encodes PSD unpacking, symmetric expansion, scaling — all
-   in its constant entries. One matmul handles everything.
-2. **Framework-agnostic.** The R matrices are scipy sparse at setup
-   time, converted once to torch CSR / JAX BCSR / MLX. No need for
-   per-framework `_unpack_svec()` / `_svec_to_symmetric()`.
-3. **Differentiable.** Sparse matmul is differentiable in all
-   frameworks. Gradients flow through `R.T` automatically —
-   no custom backward needed for recovery.
-4. **No CSC-to-CSR permutation.** Forward maps can be pre-arranged
-   for the solver's preferred format. The negation of A is baked in.
-5. **No b extraction.** The b map produces b directly.
-6. **Clean gradients.** The matrix `M` contains only finite entries,
-   so `M.T @ d_output` in the backward pass is free of `inf`. The
-   constant offset `v` (which may contain `inf` for default bounds)
-   is a constant with zero gradient — it never participates in
-   differentiation at all.
-
-The solver interfaces also simplify: the `torch_to_data()` methods
-become just sparse matmuls, no reconstruction from CSC indices.
+CVXPYlayers' recovery logic (~100 lines of per-cone-type dispatch
+and per-framework svec unpacking) becomes one sparse matmul per
+direction (`R_primal @ solver_x`, `R_dual @ solver_y`). The R
+matrices are scipy sparse at setup time, converted once to the
+framework's sparse format. Forward maps similarly replace the
+per-solver `torch_to_data()` reconstruction with sparse matmuls.
+The `(M, v)` split ensures `inf` values in constant offsets never
+participate in differentiation (see Constant Offset Representation).
 
 ### CVXPY's Own Solvers
 
@@ -432,146 +375,30 @@ CVXPYlayers would retain:
 
 ## Dual Variable Recovery
 
-### The Problem
+Dual variable recovery — mapping the solver's flat dual vector back to
+per-constraint values — is reimplemented in all three codebases.
 
-Dual variable recovery -- mapping the solver's flat dual vector back to
-per-constraint values that the user can access -- is implemented in all
-three codebases with different approaches and different levels of
-fragility.
+**In CVXPY**: The reduction chain's `invert()` walks constraints,
+slices the dual vector, and applies solver-specific unpacking (e.g.,
+PSD svec format differences between SCS and Clarabel).
 
-### How It Works Today
+**In CVXPYgen**: `get_dual_variable_info()` reimplements this as a
+static mapping by tracing `cons_id_map` through hardcoded
+`inverse_data[-1..-4]` indices. This is fragile — it depends on the
+exact reduction chain ordering and has different semantics for conic
+vs quadratic solvers.
 
-**In CVXPY**: The reduction chain's `invert()` method handles dual
-recovery in three layers:
-
-1. **Solver `invert()`** splits the flat dual vector at the
-   Zero/inequality boundary using `cone_dims.zero` as the split point.
-   It calls `utilities.get_dual_values()` to walk the constraint list
-   and slice the vector into per-constraint chunks. Solver-specific
-   `extract_dual_value()` methods handle special cases (PSD cone
-   storage format differences between SCS lower-triangular and
-   Clarabel upper-triangular).
-
-2. **`ConeMatrixStuffing.invert()`** remaps constraint IDs from the
-   stuffed problem back to the original problem using `cons_id_map`
-   and reshapes dual values to match the user's constraint shapes.
-
-3. **Upstream reductions** (Dcp2Cone, CvxAttr2Constr, etc.) each have
-   their own `cons_id_map` that traces constraint IDs backward through
-   the chain.
-
-**In CVXPYgen**: `get_dual_variable_info()` (cpg.py, line 394)
-reimplements the same tracing logic, but produces a static mapping
-instead of applying it to concrete values. It:
-
-1. Manually indexes into `inverse_data` using hardcoded offsets
-   (`inverse_data[-1]`, `[-2]`, `[-3]`, `[-4]`) with different
-   ordering for conic vs quadratic solver types.
-2. Chains the `cons_id_map` dictionaries to trace each user constraint
-   ID to its canonical constraint ID.
-3. Computes per-constraint offsets into the solver's dual vector(s).
-4. Handles `dual_var_split` (ECOS/QOCO have separate `y`/`z` vectors;
-   SCS/Clarabel/OSQP have a single dual vector).
-5. Produces a `DualVariableInfo` with `name_to_offset`, `name_to_vec`,
-   `name_to_indices`, `name_to_shape`.
-
-This is some of the most fragile code in CVXPYgen. It depends on the
-exact ordering of reductions in CVXPY's chain and breaks if reductions
-are added, removed, or reordered. The hardcoded `inverse_data[-4]`
-indexing with different semantics for conic vs quadratic solvers is
-particularly brittle.
-
-**In CVXPYlayers** (v1.0.3, master): Full dual variable support has
-been implemented with a cleaner approach that avoids tracing through
-`inverse_data` chains entirely. Users pass `constraint.dual_variables[N]`
-objects in the `variables` list when constructing `CvxpyLayer`:
-
-```python
-layer = CvxpyLayer(
-    problem,
-    parameters=[c, b],
-    variables=[x, eq_con.dual_variables[0]],  # mix primals and duals
-)
-x_opt, eq_dual = layer(c_t, b_t)
-```
-
-The implementation in `parse_args.py` uses three key functions:
-
-1. **`_build_dual_var_map()`**: Creates a `dict[int, Constraint]`
-   mapping dual variable IDs to their parent constraints by iterating
-   over all constraints' `.dual_variables`.
-
-2. **`_build_constr_id_to_slice()`**: Directly computes constraint-to-
-   slice mappings from `param_prob.constraints` using CVXPY's canonical
-   cone ordering (Zero -> NonNeg -> SOC -> ExpCone -> PSD -> PowCone3D).
-   No `inverse_data` or `cons_id_map` tracing needed.
-
-3. **`_build_dual_recovery()`**: Creates `VariableRecovery` with
-   `source="dual"`, handling PSD duals (svec format with 1/sqrt(2)
-   off-diagonal scaling), multi-dual constraints (SOC has 2 duals,
-   ExpCone has 3), and per-dual-variable offsets within a constraint.
-
-The `VariableRecovery` dataclass now has active fields:
-
-```python
-@dataclass
-class VariableRecovery:
-    primal: slice | None
-    dual: slice | None
-    shape: tuple[int, ...]
-    is_symmetric: bool = False
-    is_psd_dual: bool = False
-    source: Literal["primal", "dual"] = "primal"
-    unpack_fn: Literal["reshape", "svec_primal", "svec_dual"] = "reshape"
-```
-
-Dual support covers all cone types (Zero, NonNeg, SOC, ExpCone, PSD,
-PowCone3D) across PyTorch, JAX, and MLX backends, with gradients
-verified via `torch.autograd.gradcheck`. SOC duals are blocked for
-Moreau (raises `ValueError`).
-
-### Two Approaches to Dual Recovery: Comparison
-
-| Aspect | CVXPYgen | CVXPYlayers |
-|---|---|---|
-| **Approach** | Traces `cons_id_map` through `inverse_data[-1..-4]` | Uses `param_prob.constraints` directly |
-| **Fragility** | High -- hardcoded reduction chain indices, different for conic vs QP | Low -- only depends on `ParamConeProg.constraints` ordering |
-| **Multi-dual** | Not clear if supported | Full support (SOC=2 duals, ExpCone=3) |
-| **PSD handling** | Via solver-specific `extract_dual_value()` | Via `unpack_fn="svec_dual"` with 1/sqrt(2) scaling |
-| **Solver split** | Explicit `dual_var_split` / `dual_var_names` per solver | Not needed -- works on the unified dual vector |
-| **Output** | `DualVariableInfo` with offset/vector/shape dicts | `VariableRecovery` with slice + unpack_fn |
-
-The CVXPYlayers approach is significantly simpler because it works
-directly with the `ParamConeProg`'s constraint list, which already
-has the canonical ordering baked in after `format_constraints()`.
+**In CVXPYlayers**: Uses `param_prob.constraints` directly to compute
+constraint-to-slice mappings, avoiding `inverse_data` entirely. This
+is simpler because `ParamConeProg.constraints` already has the
+canonical ordering baked in after `format_constraints()`.
 
 ### Proposed: `R_dual` Recovery Matrix
 
-Rather than exposing a `constr_id_to_dual_slice` dictionary (the
-intermediate step CVXPYlayers computes in `_build_constr_id_to_slice()`),
-the `CanonicalMaps` object includes a single sparse matrix `R_dual`
-that does the *complete* dual recovery in one matmul. This is the
-same philosophy as `R_primal`: bake all the linear operations
-(slicing, svec unpacking, 1/sqrt(2) scaling, reordering) into
-constant sparse matrix entries computed once at compilation time.
-
-The `DualInfo` metadata tells downstream code how to split and
-reshape the output:
-
-```python
-# In CanonicalMaps (already defined in Proposal section):
-R_dual: scipy.sparse.csr_array    # R_dual @ solver_y -> flat user duals
-dual_vars: list[DualInfo]         # per-constraint metadata
-
-# Usage:
-dual_flat = R_dual @ solver_y     # one sparse matmul
-for di in canon.dual_vars:
-    dual_val = dual_flat[di.offset : di.offset + di.size]
-    dual_val = dual_val.reshape(di.shape)
-```
-
-No per-cone-type dispatch, no `unpack_fn` branching, no
-`_svec_to_symmetric()`. The `R_dual` matrix handles everything:
+The `CanonicalMaps` object includes `R_dual`, a single sparse matrix
+that does complete dual recovery in one matmul — the same philosophy
+as `R_primal`. It walks `param_prog.constraints` in canonical cone
+order, building:
 
 - **Non-PSD constraints**: Identity rows selecting from `solver_y`.
 - **PSD constraints**: Svec-to-full expansion with 1/sqrt(2) on
@@ -580,78 +407,9 @@ No per-cone-type dispatch, no `unpack_fn` branching, no
 - **Multi-dual constraints** (SOC, ExpCone): Each dual variable gets
   its own `DualInfo` entry pointing to its slice of the output.
 
-### What This Replaces
-
-| Currently in CVXPYgen | Replaced by |
-|---|---|
-| `get_dual_variable_info()` (~60 lines) | `canon.R_dual` + `canon.dual_vars` |
-| Hardcoded `inverse_data[-1..-4]` indexing | Not needed -- R_dual computed from `ParamConeProg.constraints` |
-| `dual_id_maps` chain tracing | Not needed -- uses canonical ordering directly |
-| `dual_var_split` / `dual_var_names` per solver | Not needed -- baked into R_dual column structure |
-| `DualVariableInfo` dataclass | `DualInfo` |
-| Solver-specific `extract_dual_value()` | Baked into R_dual entries (1/sqrt(2) scaling, tri ordering) |
-
-| Currently in CVXPYlayers | Replaced by |
-|---|---|
-| `_build_constr_id_to_slice()` (~40 lines) | Baked into R_dual construction |
-| `_build_dual_var_map()` (~15 lines) | Still needed (maps dual var IDs to constraints) |
-| `_build_dual_recovery()` (~25 lines) | `canon.dual_vars` metadata |
-| `_unpack_svec()` / `_svec_to_symmetric()` | Baked into R_dual entries |
-| Per-framework svec unpacking logic | One sparse matmul (framework-agnostic after conversion) |
-
-### Implementation Notes
-
-The `R_dual` construction follows CVXPYlayers' approach of walking
-`param_prog.constraints` in canonical cone order -- the same logic
-as `_build_constr_id_to_slice()`, but instead of producing slices,
-it produces rows of a sparse matrix:
-
-```python
-def _build_R_dual(param_prog, solver_name):
-    rows, cols, vals = [], [], []
-    out_offset = 0
-    in_offset = 0
-    dual_vars = []
-
-    for c in param_prog.constraints:
-        if isinstance(c, PSD):
-            n = c.shape[0]
-            svec_size = n * (n + 1) // 2
-            full_size = n * n
-            # Build svec-to-full expansion block
-            _add_svec_unpack_block(
-                rows, cols, vals,
-                out_offset, in_offset, n,
-                lower_tri=(solver_name == "SCS"),
-            )
-            dual_vars.append(DualInfo(
-                constraint_id=c.id, shape=c.shape,
-                offset=out_offset, size=full_size,
-                cone_type="psd", is_psd=True,
-            ))
-            out_offset += full_size
-            in_offset += svec_size
-        else:
-            # Identity block
-            for i in range(c.size):
-                rows.append(out_offset + i)
-                cols.append(in_offset + i)
-                vals.append(1.0)
-            dual_vars.append(DualInfo(
-                constraint_id=c.id, shape=c.shape,
-                offset=out_offset, size=c.size,
-                cone_type=type(c).__name__.lower(),
-                is_psd=False,
-            ))
-            out_offset += c.size
-            in_offset += c.size
-
-    R_dual = scipy.sparse.csr_array(
-        (vals, (rows, cols)),
-        shape=(out_offset, in_offset),
-    )
-    return R_dual, dual_vars
-```
+This replaces CVXPYgen's `get_dual_variable_info()`, its hardcoded
+`inverse_data` indexing, and CVXPYlayers' per-cone-type unpacking
+logic.
 
 ## Detailed Design Questions
 
@@ -676,16 +434,8 @@ def get_canonical_maps(
 
 ### 2. How are constant offsets represented?
 
-Each forward map is an `(M, v)` pair: a sparse matrix `M` and a dense
-offset vector `v`. The solver input is `M @ param_vec + v`. This
-separates the parametric part (which downstream libraries differentiate
-through) from the constant part (which may contain `inf` or other
-values that should not participate in gradient computation). See
+Each forward map is an `(M, v)` pair: `M @ param_vec + v`. See
 "Constant Offset Representation" below for the full rationale.
-
-Note: `ParamConeProg` and CVXPYgen currently use a trailing-`1.0`
-convention where the last column of a single matrix encodes `v`.
-`get_canonical_maps()` splits this into `(M, v)` at construction time.
 
 ### 3. Should this replace or augment `apply_parameters()`?
 
