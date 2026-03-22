@@ -8,9 +8,9 @@ Claude Opus 4.6, with prompting from Parth Nobel
 ## Summary
 
 CVXPY should expose a public API on its solver interfaces that provides
-**pre-decomposed parametric affine maps** from user parameters to
+**compiled parametric affine maps** from user parameters to
 solver-specific canonical parameters (P, q, A, b, etc.). This would
-upstream the core decomposition logic currently duplicated in CVXPYgen's
+upstream the map-construction logic currently duplicated in CVXPYgen's
 `solvers.py` and allow CVXPYlayers to drastically simplify its solver
 interface layer.
 
@@ -62,7 +62,7 @@ concrete numerical values. `ConicSolver.apply()` calls
 operate on evaluated numbers, not on the parametric affine maps.
 
 **In CVXPYgen**: The `SolverInterface.get_affine_map()` method
-(in `solvers.py`) reimplements the same decomposition, but on the
+(in `solvers.py`) reimplements the same logic, but on the
 parametric affine maps. For each canonical parameter (P, q, A, b, etc.),
 it extracts the relevant rows from `reduced_P.reduced_mat`,
 `param_prob.q`, and `reduced_A.reduced_mat`, applies sign corrections,
@@ -108,14 +108,14 @@ solver inputs, and from solver outputs back to user variables — is a
 multiply. CVXPY should expose the complete set of these matrices as
 a public API.
 
-The entire data flow becomes six sparse matmuls:
+The entire data flow becomes six sparse matmuls plus constant offsets:
 
 ```
 Forward (parameters → solver inputs):
-    P_map  @ param_vec  →  P values
-    q_map  @ param_vec  →  q/c vector
-    A_map  @ param_vec  →  A values     (sign-corrected)
-    b_map  @ param_vec  →  b vector
+    P_map  @ param_vec + P_offset  →  P values
+    q_map  @ param_vec + q_offset  →  q/c vector
+    A_map  @ param_vec + A_offset  →  A values     (sign-corrected)
+    b_map  @ param_vec + b_offset  →  b vector
 
 Recovery (solver outputs → user variables):
     R_primal  @ solver_x  →  [var1_flat; var2_flat; ...]
@@ -156,8 +156,8 @@ class CanonicalMaps:
     """Complete set of sparse matrices for a compiled parametric problem.
 
     Forward maps (parameter → solver input):
-        map @ param_vec = solver_input_values
-        where param_vec is the flat parameter vector with trailing 1.0.
+        M @ param_vec + v = solver_input_values
+        where param_vec is the flat parameter vector (no trailing 1.0).
 
     Recovery maps (solver output → user variables):
         R @ solver_vec = user_variable_values (flat, concatenated)
@@ -165,9 +165,10 @@ class CanonicalMaps:
 
     # --- Forward maps (parameter → solver input) ---
 
-    # Per-canonical-parameter affine maps (sparse CSR matrices).
-    maps: dict[str, scipy.sparse.csr_array]
-    # e.g. {"P": ..., "q": ..., "d": ..., "A": ..., "b": ...}
+    # Per-canonical-parameter affine maps: (matrix, offset) pairs.
+    # Usage: maps[key][0] @ param_vec + maps[key][1] = values
+    maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
+    # e.g. {"P": (M, v), "q": (M, v), "d": (M, v), "A": (M, v), ...}
 
     # Sparsity structure of output matrices (CSC format).
     # For matrix params (P, A, G): (indices, indptr, shape).
@@ -229,8 +230,8 @@ class ConicSolver(Solver):
     def get_canonical_maps(self, param_prog: ParamConeProg) -> CanonicalMaps:
         """Return the complete set of sparse matrices.
 
-        Forward maps: decomposes param_prog's monolithic tensors into
-        per-canonical-parameter affine maps with solver-specific sign
+        Forward maps: compiles param_prog's monolithic tensors into
+        per-solver-parameter affine maps with solver-specific sign
         conventions applied.
 
         Recovery maps: builds sparse matrices that map the solver's
@@ -323,9 +324,9 @@ dual_info = get_dual_variable_info(problem, inverse_data, ...)
 
 # After
 canon = solving_chain.solver.get_canonical_maps(param_prog)
-# Forward maps -- generate C code for each sparse matmul:
-for p_id, mapping in canon.maps.items():
-    codegen_sparse_matmul(p_id, mapping)
+# Forward maps -- generate C code for each affine map:
+for p_id, (M, v) in canon.maps.items():
+    codegen_sparse_matmul(p_id, M, v)
 # Primal recovery -- generate C code for R_primal @ x:
 codegen_sparse_matmul("primal_recovery", canon.R_primal)
 # Dual recovery -- generate C code for R_dual @ y:
@@ -382,6 +383,11 @@ Key simplifications:
 4. **No CSC-to-CSR permutation.** Forward maps can be pre-arranged
    for the solver's preferred format. The negation of A is baked in.
 5. **No b extraction.** The b map produces b directly.
+6. **Clean gradients.** The matrix `M` contains only finite entries,
+   so `M.T @ d_output` in the backward pass is free of `inf`. The
+   constant offset `v` (which may contain `inf` for default bounds)
+   is a constant with zero gradient — it never participates in
+   differentiation at all.
 
 The solver interfaces also simplify: the `torch_to_data()` methods
 become just sparse matmuls, no reconstruction from CSC indices.
@@ -668,18 +674,18 @@ def get_canonical_maps(
 ) -> CanonicalMaps:
 ```
 
-### 2. Should the constant offset column be included?
+### 2. How are constant offsets represented?
 
-Yes. Following CVXPYgen's convention, the parameter vector has a
-trailing `1.0` entry, and the last column of each map encodes the
-constant part of the affine mapping. This means:
+Each forward map is an `(M, v)` pair: a sparse matrix `M` and a dense
+offset vector `v`. The solver input is `M @ param_vec + v`. This
+separates the parametric part (which downstream libraries differentiate
+through) from the constant part (which may contain `inf` or other
+values that should not participate in gradient computation). See
+"Constant Offset Representation" below for the full rationale.
 
-```
-values = map @ [user_param_1, ..., user_param_k, 1.0]
-       = map[:, :-1] @ [user_param_1, ..., user_param_k] + map[:, -1]
-```
-
-This is the existing convention in both `ParamConeProg` and CVXPYgen.
+Note: `ParamConeProg` and CVXPYgen currently use a trailing-`1.0`
+convention where the last column of a single matrix encodes `v`.
+`get_canonical_maps()` splits this into `(M, v)` at construction time.
 
 ### 3. Should this replace or augment `apply_parameters()`?
 
@@ -721,6 +727,68 @@ may also be parametric (via `lb_tensor`, `ub_tensor`). If present,
 `get_canonical_maps()` should include maps for these as well (e.g.,
 `"lb"` and `"ub"` keys).
 
+### 7. Why one recovery matrix instead of per-variable matrices?
+
+One large sparse matmul is significantly faster than many small ones,
+especially on GPU where kernel launch overhead dominates. Per-variable
+matrices would tempt users into N separate matmuls instead of one.
+
+To handle the case where users only care about a subset of variables
+(common in MPC, where you may only need `u_0` out of thousands of
+state variables across time steps), `Problem` exposes a higher-level
+method that wraps `get_canonical_maps()` and row-slices the recovery
+matrices:
+
+```python
+class Problem:
+    def get_canonical_maps(
+        self,
+        solver: str,
+        variables: list[Variable | DualVariable] | None = None,
+        *,
+        gp: bool = False,
+        # ... same compilation kwargs as get_problem_data()
+    ) -> CanonicalMaps:
+        """Return parametric affine maps for this problem.
+
+        Compiles the problem (or uses the cached compilation) and
+        returns a CanonicalMaps with forward maps from parameters to
+        solver inputs and recovery maps from solver outputs to user
+        variables.
+
+        Parameters
+        ----------
+        solver : str
+            Target solver (e.g., cp.SCS, cp.CLARABEL).
+        variables : list, optional
+            Subset of Variable / DualVariable objects to include in
+            recovery. When None, all variables and constraint duals
+            are recovered. When specified, R_primal / R_dual contain
+            only the rows for the requested variables, and
+            primal_vars / dual_vars are filtered to match.
+        """
+        # 1. Compile / use cache to get param_prog, inverse_data
+        # 2. Call solver.get_canonical_maps(param_prog) for full maps
+        # 3. If variables is not None, row-slice R_primal / R_dual
+        #    using VarInfo/DualInfo offsets
+        ...
+```
+
+The `Problem` method is the right level for this because:
+
+- It has access to the compilation cache (`_cache.param_prog`,
+  `_cache.solving_chain`), avoiding redundant compilation.
+- It can map user-level `Variable` objects to canonical variable IDs
+  via the `inverse_data` chain (the reduction chain may rename or
+  split variables).
+- The solver's `get_canonical_maps()` stays simple — it always builds
+  full recovery matrices over canonical variables, with no knowledge
+  of which user variables matter.
+
+Both CVXPYlayers and CVXPYgen would call `problem.get_canonical_maps()`
+with their known variable subsets, replacing their current direct
+access to `param_prog` internals.
+
 ## Migration Path
 
 ### Phase 1: Add the API to CVXPY
@@ -735,7 +803,7 @@ the same values as the existing `apply_parameters()` + solver
 
 Replace `parse_args.py`'s direct access to `reduced_P`, `q`,
 `reduced_A` with a call to `get_canonical_maps()`. Simplify all
-solver interfaces to consume the pre-decomposed maps. The
+solver interfaces to consume the compiled maps. The
 `problem_data_index` plumbing goes away.
 
 ### Phase 3: Adopt in CVXPYgen
@@ -760,22 +828,22 @@ CVXPYgen's `SolverInterface` class hierarchy into CVXPY wholesale.
 
 **Rejected because**: CVXPYgen's solver interfaces are tightly coupled
 to code generation concerns (C type names, augmentation with -inf,
-constraint info for code layout). The decomposition logic is what we
-want; the codegen scaffolding should stay in CVXPYgen.
+constraint info for code layout). The map-construction logic is what
+we want; the codegen scaffolding should stay in CVXPYgen.
 
 ### Alternative 2: Have CVXPYlayers use CVXPYgen's decomposition
 
 CVXPYlayers could depend on CVXPYgen and call its `get_affine_map()`.
 
 **Rejected because**: This creates an unnecessary dependency and
-doesn't fix the underlying problem (the decomposition logic belongs
+doesn't fix the underlying problem (the map-construction logic belongs
 in CVXPY, not in a downstream library).
 
-### Alternative 3: Only expose a parametric `apply_parameters_decomposed()`
+### Alternative 3: Only expose a split `apply_parameters()`
 
-Instead of returning affine maps, return the decomposed concrete values
-from a single `apply_parameters()` call (i.e., return `P_values, q, d,
-A_values, b` instead of `c, d, A, b`).
+Instead of returning affine maps, return the concrete values split
+per solver parameter from a single `apply_parameters()` call (i.e.,
+return `P_values, q, d, A_values, b` instead of `c, d, A, b`).
 
 **Rejected because**: This doesn't help CVXPYgen (which needs the maps,
 not the values) and doesn't fully help CVXPYlayers (which needs the
@@ -785,17 +853,17 @@ maps to do the matmul in its own tensor framework).
 
 1. **Should `get_canonical_maps()` be cached?** Probably yes, since the
    maps are static for a given solver + problem. The `ParamConeProg`
-   is already cached; the decomposed maps could be cached alongside it.
+   is already cached; the compiled maps could be cached alongside it.
 
 2. **Should the API support the gradient/backward use case?** CVXPY's
    `backward()` uses `apply_param_jac()`, which is the transpose of
-   the parameter mapping. The decomposed maps could provide this too:
+   the parameter mapping. The compiled maps could provide this too:
    `map.T @ dvalues = dparam_vec`. This would simplify CVXPY's own
    backward path and could be useful for CVXPYlayers' derivative
    computation.
 
-3. **Naming**: `get_canonical_maps()` vs `get_parametric_decomposition()`
-   vs `decompose_param_prog()` vs something else?
+3. **Naming**: `get_canonical_maps()` vs `get_compiled_maps()`
+   vs `compile_param_maps()` vs something else?
 
 4. **PSD dual storage convention**: The `R_dual` matrix bakes in the
    solver's PSD storage convention (SCS lower-triangular, Clarabel
@@ -816,3 +884,62 @@ maps to do the matmul in its own tensor framework).
    `DualInfo` entry per dual variable (not per constraint). Does
    CVXPYgen expose multi-dual constraints, or only one dual per
    constraint?
+
+## Constant Offset Representation
+
+### The Problem
+
+The `ParamConeProg` internally represents affine maps using a
+trailing-`1.0` convention: a single matrix whose last column encodes
+the constant term. For forward maps, this means
+`combined_map @ [params..., 1.0] = values`. This is efficient and
+convenient for CVXPY's own solve path.
+
+Today, `inf` values never appear in any matrix. OSQP's lower bounds
+`l` include `-inf` for inequality rows (representing "no lower
+bound"), but this is hardcoded at solve time in `osqp_qpif.py` — the
+`-inf` is concatenated onto the evaluated `b` vector, never stored in
+`ParamConeProg`'s affine map matrices. If we naively consolidated `l`
+into a single affine map (as proposed), the `-inf` entries would end
+up in the last column of the map matrix. This would create two
+problems for downstream libraries:
+
+1. **Differentiability.** If the forward map is a single matrix
+   `[M | v]` and a downstream library differentiates through
+   `[M | v] @ [p; 1]` as a sparse matmul, the backward pass computes
+   `[M | v].T @ d_output`. Any `d_output` entry that is zero for an
+   `inf` row produces `inf * 0.0 = NaN`, poisoning gradients. Even if
+   `d_output` is nonzero there, `inf` entries in a sparse matrix
+   multiply produce fragile numerics.
+
+2. **Embedded efficiency.** In CVXPYgen's embedded context, the
+   constant column means that *every* re-solve recomputes the full
+   output vector, including entries that are always `inf`. Separating
+   constants lets CVXPYgen skip recomputation of purely constant
+   entries and avoids representing `inf` in generated C code.
+
+### Options Considered
+
+**Option A: Split into `(M, v)` pairs.** Each forward map becomes a
+sparse matrix `M` (parametric part, all finite entries) and a dense
+vector `v` (constant offset, may contain `inf`). The solver input is
+`M @ param_vec + v`. This is the chosen approach.
+
+**Option B: Exclude purely constant rows from the map.** Rows with no
+parametric dependence (e.g., always-`inf` bounds) would be omitted
+from `M` entirely and provided as a separate constant vector. This is
+a special case of Option A that additionally changes the shape of `M`.
+
+### Cost Analysis
+
+The `(M, v)` split vs. the trailing-`1.0` convention costs zero extra
+flops: the trailing-`1.0` convention computes `M @ p + v * 1.0`; the
+split computes `M @ p + v`. The number of flops spent on `inf` entries
+is exactly one addition per `inf` entry in `v`, with no
+multiplications. Extra storage is one dense vector per map (negligible).
+
+Option B was not chosen because it complicates the API (the caller
+must recombine constant and parametric rows to get the full output
+vector) without meaningful efficiency gains. That said, CVXPYgen can
+trivially identify the non-`inf` entries of `v` and construct reduced
+maps itself if it wants to skip those rows in generated code.
