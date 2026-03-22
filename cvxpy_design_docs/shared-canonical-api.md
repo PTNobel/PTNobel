@@ -5,6 +5,9 @@
 ## Authors
 Claude Opus 4.6, with prompting from Parth Nobel
 
+## Reviewers
+Max Schaller
+
 ## Summary
 
 CVXPY should expose a public API on its solver interfaces that provides
