@@ -564,8 +564,8 @@ maps to do the matmul in its own tensor framework).
    does it also use the `inverse_data` chain for primal variable
    recovery? (Primal recovery via `R_primal` should cover that case.)
 
-6. **Multi-dual constraints**: SOC has 2 dual variables, ExpCone has
-   3. The `R_dual` / `DualInfo` design handles this by having one
+6. **Multi-dual constraints**: SOC has 2 dual variables, ExpCone has 3.
+   The `R_dual` / `DualInfo` design handles this by having one
    `DualInfo` entry per dual variable (not per constraint). Does
    CVXPYgen expose multi-dual constraints, or only one dual per
    constraint?
