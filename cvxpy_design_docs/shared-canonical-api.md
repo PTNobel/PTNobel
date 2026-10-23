@@ -87,9 +87,13 @@ time or redo PSD conversion in the terminal layout utility.
 - **Forward maps:** `maps[name] = (M, v)` means `values = M @ p + v`.
   `M` has finite entries. Infinite bound constants belong only in `v`, with zero
   corresponding rows in `M`. The parameter adjoint uses `M.T`, excluding `v`.
-- **Coordinates:** The proposed default `p` concatenates original parameters,
-  flattened in Fortran order, with no trailing constant. Compose internal linear
-  packing into the maps. Values must satisfy the original parameter attributes.
+- **Coordinates:** `p` uses the compact parameter coordinates chosen by
+  compilation, with no trailing constant. Sparse parameters contribute only
+  stored entries; symmetric parameters use the compiled triangular packing.
+  Expose each block's original parameter ID, logical shape, packed size, offset,
+  and exact entry order. Packing and its adjoint must work directly on stored
+  entries, without allocating dense parameters or dense packing matrices.
+  Unstructured dense parameters retain Fortran order.
 - **Structure:** Matrix values follow an explicitly declared CSC/CSR structure
   and triangle. Structural slots remain fixed across parameter assignments,
   including coefficients that evaluate to zero. Bound maps and fixed cone data
@@ -128,14 +132,11 @@ can follow incrementally.
 
 ## Decisions for review
 
-1. **Parameter coordinates:** Is the full original-parameter convention the
-   right default, or should compact packing be available initially for sparse
-   and symmetric parameters?
-2. **Recovery scope:** Start with separate primal/dual maps and reject chains
+1. **Recovery scope:** Start with separate primal/dual maps and reject chains
    requiring cross-recovery, or expose a block operator on `[solver_x; solver_y]`
    immediately? Forward-only requests should remain usable when recovery is
    unsupported.
-3. **Initial coverage:** Which cone conversions, direct-cone paths, and compiled
+2. **Initial coverage:** Which cone conversions, direct-cone paths, and compiled
    program representations must support export in the first version?
 
 ## Appendix: contract sketch
@@ -171,6 +172,16 @@ class DualInfo:
 
 
 @dataclass
+class ParameterInfo:
+    param_id: int
+    shape: tuple[int, ...]  # Logical shape, not packed storage size.
+    offset: int
+    size: int              # Number of packed entries.
+    # Ordered logical indices for compact storage; None for dense F-order.
+    indices: tuple[np.ndarray, ...] | None
+
+
+@dataclass
 class CanonicalMaps:
     maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
     structures: dict[str, MatrixStructure]
@@ -179,6 +190,7 @@ class CanonicalMaps:
     primal_vars: list[VarInfo]
     dual_vars: list[DualInfo]
     parameters: list[Parameter]
+    parameter_layouts: list[ParameterInfo]
     param_id_to_col: dict[int, int]
     param_id_to_size: dict[int, int]
     total_param_size: int
@@ -192,6 +204,15 @@ Missing objectives or bounds follow the adapter's declared input contract.
 Empty recovery selections have zero rows; scalars have shape `()` and size one.
 The `d` map is the compiled objective offset, not a solver input; recovering an
 original maximization objective also requires its sign.
+
+`param_id_to_size` and `total_param_size` count packed entries, not logical
+parameter elements. `ParameterInfo.indices` records the compilation's actual
+packing order; consumers must not infer a triangle ordering from shape alone.
+Already-packed inputs can be concatenated directly. For logical inputs, packing
+gathers the declared entries and its adjoint accumulates cotangents into those
+input coordinates using sparse storage when applicable. It does not implicitly
+duplicate off-diagonal cotangents into a full symmetric matrix. Any framework
+conversion to a different gradient representation must be explicit.
 
 ### Example adapter layouts
 
