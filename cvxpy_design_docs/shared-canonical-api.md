@@ -51,12 +51,20 @@ that column in `v`.
 
 These IDs need not be the original parameter IDs. `CvxAttr2Constr` creates fresh
 reduced parameters for sparse, diagonal, and symmetric attributes;
-`Chain.compose_param_id_map()` traces original IDs to lists of compiled IDs.
+`Problem.get_canonical_maps()` includes the result of
+`Chain.compose_param_id_map()` as `canon.param_id_map`: original IDs map to lists
+of compiled IDs, and omitted IDs are unchanged.
 The reduction's value transformation determines the entries of each compiled
 block. In particular, sparse parameters contribute their stored entries, without
 densification. The ID correspondence is separate from vector offsets. The
 reductions handle parameter updates and derivatives through `update_parameters()`,
 `param_forward()`, and `param_backward()`.
+
+CVXPYgen derives its user-parameter-to-solver-input update adjacency from
+`param_id_map` and the nonzero columns of each `M`. The compiled IDs identify
+column blocks through `param_id_to_col` and `param_id_to_size`; CVXPYgen combines
+dependencies across all compiled blocks belonging to an original parameter.
+Constant offsets `v` contribute no dependencies.
 
 `R_primal` and `R_dual` map the solver's primal and dual vectors to concatenated
 original-variable values. `VarInfo` and `DualInfo` identify each output's ID,
@@ -177,6 +185,7 @@ class CanonicalMaps:
     cone_dims: ConeDims
     constraints: list[Constraint]
     parameters: list[Parameter]  # Compiled parameters.
+    param_id_map: dict[int, list[int]]  # Original -> compiled IDs; omitted IDs unchanged.
     param_id_to_col: dict[int, int]  # Excludes the constant sentinel.
     param_id_to_size: dict[int, int]
     total_param_size: int
