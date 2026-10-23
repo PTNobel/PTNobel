@@ -12,11 +12,11 @@ Expose the affine maps from parameters to solver inputs and the linear maps from
 solver outputs to requested primal and dual variables. CVXPYgen can generate code
 from them; CVXPYlayers can evaluate them in its tensor framework.
 
-The restructured solving chain lets us put most construction in shared reductions.
-Each reduction should expose the numerical transformation it owns. The chain
-composes those transformations; solver adapters declare only their remaining
-input/output layout. We should not introduce a second hierarchy of solver-specific
-map builders.
+Export parameter-to-data maps from the compiled program after cone conversion,
+attribute lowering, and row formatting. Build solution-recovery maps by composing
+operators supplied by the reductions that changed the variables or constraints.
+Existing solver interfaces then specify the final changes needed by their solver,
+such as splitting constraint rows, changing signs, or selecting a matrix triangle.
 
 ```python
 canon = problem.get_canonical_maps(
