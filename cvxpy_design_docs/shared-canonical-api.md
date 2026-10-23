@@ -25,38 +25,20 @@ dual_flat = canon.R_dual @ solver_y
 
 ## Map construction
 
-Export forward maps from the final compiled program. Cone conversion, attribute
-lowering, and row formatting are already reflected in its coefficients. Earlier
-reductions supply parameter-packing and solution-recovery operators; the chain
-composes them using the metadata recorded during compilation.
+Export forward maps from the final compiled program. Add sparse parameter-packing
+and recovery operators alongside the reductions' `invert()` implementations;
+compose them in `SolvingChain`. Share the recovery operators with numerical
+inversion, including recovery from multiple auxiliary constraint duals.
 
-| Owner | Maps or metadata to expose |
-| --- | --- |
-| `CvxAttr2Constr` | Parameter packing; symmetric, diagonal, and sparse primal expansion. |
-| `Dcp2Cone` and cone conversions | Original-output recovery from canonical variables and constraint duals, including auxiliary constraints. `ExactCone2Cone` supplies PSD/svec dual recovery using `SolverInfo`. |
-| `ConeMatrixStuffing` / compiled `ParamProb` | Objective, constraint, and bound affine maps; matrix structures; variable and constraint slices. |
-| `ConeFormat` | Its signed row permutation and the dual-coordinate recovery operator. |
-| `ExtractDirectCones` | Correspondence between removed constraint rows and native direct-cone dual outputs. |
-| Solver interface | Input names, row splits/stacks, final signs, triangular storage, CSC/CSR ordering, and native output blocks. |
-| `SolvingChain` / `Problem` | Composition, requested-output selection, and caching with the compilation. |
-
-Trace IDs with the existing chain helpers and compose sparse operators for
-packing, scaling, and scattering. Recovery from several auxiliary constraints
-selects from their combined dual blocks. Reuse these operators in `invert()` so
-numerical and exported recovery share an implementation.
-
-Solver interfaces specify their final layout operations using shared utilities
-for selection, permutation, signs, stacking, and constant insertion. These
-utilities transform values maps and sparse structures together. They operate on
-the program produced by the resolved chain: conic interfaces receive formatted
-rows; QP interfaces receive unformatted rows. PSD scaling and cone interleaving
-remain in the reductions that perform them.
+Solver interfaces specify the remaining signs, row splits/stacks, triangular
+extraction, and CSC/CSR ordering using shared layout utilities. Apply each
+operation to both the values map and sparse structure.
 
 ## Contract
 
 - **Affine maps:** `maps[name] = (M, v)` gives `M @ p + v`. `M` contains finite
   coefficients. Constant infinite bounds appear only in `v`, with zero rows in
-  `M`; parameter adjoints use `M.T`.
+  `M`.
 - **Parameter storage:** `p` concatenates compact blocks with no constant
   sentinel. Sparse parameters contribute stored entries; symmetric parameters
   use the compiled triangular packing. Each block records its original ID,
@@ -73,9 +55,6 @@ remain in the reductions that perform them.
   explicit constraint duals; a list selects outputs in caller order within each
   recovery vector. An empty list requests forward maps only. Construct only
   requested recovery rows. Raise an error for unsupported requested recovery.
-
-Parameter value changes reuse the compiled maps. Exported arrays must not alias
-mutable cached tensors.
 
 ## Decisions for review
 
@@ -142,57 +121,16 @@ class CanonicalMaps:
     solver_metadata: dict[str, object]
 ```
 
-`M.shape == (number_of_output_values, total_param_size)`; its CSR format is
-independent of the output matrix format. `solver_metadata` supplies cone order,
-fixed cone parameters, vector lengths, and native output block order. The `d` map
-contains the compiled objective offset; original-objective recovery also needs
-the maximization/minimization sign.
-
 `param_id_to_size` and `total_param_size` count packed entries.
-`ParameterInfo.indices` gives their logical indices in packing order. The packing
-adjoint scatters cotangents into those coordinates without duplicating
-off-diagonal cotangents into a full symmetric matrix.
+`ParameterInfo.indices` records the gather order; its adjoint scatters into those
+coordinates without duplicating symmetric off-diagonal cotangents.
+`solver_metadata` supplies cone order, fixed cone parameters, vector lengths,
+and native output block order. The `d` map contains the compiled objective offset;
+original-objective recovery also needs the maximization/minimization sign.
 
-### Example adapter layouts
+### Source references
 
-For the base conic adapter's formatted program, let its exported constraint
-coefficients be `A0, b0`. The adapter uses `A = -A0`, `b = b0`. SCS names the
-linear objective `c`; Clarabel names it `q`. PSD scaling and cone interleaving
-have already happened upstream.
-
-For OSQP's unformatted program, let its coefficients be `AF, bg` with equality
-rows first:
-
-```text
-A_eq =  AF[:n_eq]       b_eq = -bg[:n_eq]
-F    = -AF[n_eq:]       g    =  bg[n_eq:]
-
-A = [A_eq; F]
-l = [b_eq; -inf]
-u = [b_eq; g]
-```
-
-Triangular extraction of `P`, CSC/CSR conversion, and duplicate consolidation
-must transform both the values map and sparse structure. Bounds
-lowered into constraints are already represented in the constraint maps.
-
-### Source snapshots
-
-Implementation references checked against upstream sources on October 23, 2026:
-
-- **CVXPY, `8280648`:**
-  [chain construction](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/solving_chain.py),
-  [ID composition](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/chain.py),
-  [attribute lowering](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cvx_attr2constr.py),
-  [exact cone conversions](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cone2cone/exact.py),
-  [compiled cone program](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/dcp2cone/cone_matrix_stuffing.py),
-  [cone formatting](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cone_format.py),
-  [direct-cone extraction](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cone2cone/extract_direct_cones.py),
-  [QP adapter](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/qp_solvers/qp_solver.py),
-  [OSQP assembly](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/qp_solvers/osqp_qpif.py).
-- **CVXPYgen, `79c0255`:**
-  [canonicalizer](https://github.com/cvxgrp/cvxpygen/blob/79c0255236b78d271285c3689a9ff0cd8079ae30/cvxpygen/canonicalizer.py),
-  [map extraction](https://github.com/cvxgrp/cvxpygen/blob/79c0255236b78d271285c3689a9ff0cd8079ae30/cvxpygen/solvers/_interface.py).
-- **CVXPYlayers, `bd9caf9`:**
-  [solver contexts](https://github.com/cvxpy/cvxpylayers/blob/bd9caf9826d758722a5c42b8a51775fcbc037ffe/src/cvxpylayers/interfaces/__init__.py),
-  [parameter and recovery bookkeeping](https://github.com/cvxpy/cvxpylayers/blob/bd9caf9826d758722a5c42b8a51775fcbc037ffe/src/cvxpylayers/utils/parse_args.py).
+CVXPY snapshot `8280648`:
+[compiled program](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/dcp2cone/cone_matrix_stuffing.py),
+[chain composition](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/chain.py),
+[cone recovery](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cone2cone/exact.py).
