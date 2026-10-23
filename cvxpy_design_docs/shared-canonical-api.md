@@ -4,7 +4,7 @@ ChatGPT generated:
 
 **Status:** Draft · **Updated:** October 23, 2026  
 **Original authors:** Claude Opus 4.6, with prompting from Parth Nobel  
-**Revision:** ChatGPT, with prompting from Parth Nobel · **Reviewer:** Max Schaller
+**Revision:** OpenAI GPT-6.1 (`gpt-6.1-sol`), with prompting from Parth Nobel · **Reviewer:** Max Schaller
 
 ## Proposal
 
