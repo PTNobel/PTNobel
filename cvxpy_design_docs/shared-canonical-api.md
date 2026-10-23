@@ -8,15 +8,8 @@ ChatGPT generated:
 
 ## Proposal
 
-Expose the affine maps from parameters to solver inputs and the linear maps from
-solver outputs to requested primal and dual variables. CVXPYgen can generate code
-from them; CVXPYlayers can evaluate them in its tensor framework.
-
-Export parameter-to-data maps from the compiled program after cone conversion,
-attribute lowering, and row formatting. Build solution-recovery maps by composing
-operators supplied by the reductions that changed the variables or constraints.
-Existing solver interfaces then specify the final changes needed by their solver,
-such as splitting constraint rows, changing signs, or selecting a matrix triangle.
+Add `Problem.get_canonical_maps()` to expose affine parameter-to-solver-data maps
+and primal/dual recovery matrices for CVXPYgen and CVXPYlayers.
 
 ```python
 canon = problem.get_canonical_maps(
@@ -30,116 +23,71 @@ primal_flat = canon.R_primal @ solver_x
 dual_flat = canon.R_dual @ solver_y
 ```
 
-## Construction belongs with the transformation
+## Map construction
 
-| Owner | Responsibility |
+Export forward maps from the final compiled program. Cone conversion, attribute
+lowering, and row formatting are already reflected in its coefficients. Earlier
+reductions supply parameter-packing and solution-recovery operators; the chain
+composes them using the metadata recorded during compilation.
+
+| Owner | Maps or metadata to expose |
 | --- | --- |
-| `CvxAttr2Constr` | Parameter packing and primal expansion for dimension-reducing attributes. |
-| `Dcp2Cone` and cone conversions | Recovery of original outputs from introduced variables and constraints, where linear. In particular, `ExactCone2Cone` owns PSD/svec conversion and dual recovery using `SolverInfo`. |
-| `ConeMatrixStuffing` / compiled `ParamProb` | Export objective, constraint, and bound affine maps, sparse structures, and variable/constraint slices. Tensor extraction belongs to the program representation. |
-| `ConeFormat` | Apply its existing signed row permutation to the compiled program; expose the corresponding dual-coordinate mapping. |
-| `ExtractDirectCones` | Preserve removed-row/direct-cone correspondence. The adapter supplies access to the native direct-cone dual outputs. |
-| Solver adapter | Declare input names, row splits/stacks, remaining signs, triangular storage, CSC/CSR ordering, and native output blocks. |
-| `SolvingChain` / `Problem` | Compose recovery and parameter coordinates, select requested outputs, and package/cache the public result. |
+| `CvxAttr2Constr` | Parameter packing; symmetric, diagonal, and sparse primal expansion. |
+| `Dcp2Cone` and cone conversions | Original-output recovery from canonical variables and constraint duals, including auxiliary constraints. `ExactCone2Cone` supplies PSD/svec dual recovery using `SolverInfo`. |
+| `ConeMatrixStuffing` / compiled `ParamProb` | Objective, constraint, and bound affine maps; matrix structures; variable and constraint slices. |
+| `ConeFormat` | Its signed row permutation and the dual-coordinate recovery operator. |
+| `ExtractDirectCones` | Correspondence between removed constraint rows and native direct-cone dual outputs. |
+| Solver interface | Input names, row splits/stacks, final signs, triangular storage, CSC/CSR ordering, and native output blocks. |
+| `SolvingChain` / `Problem` | Composition, requested-output selection, and caching with the compilation. |
 
-The forward maps already exist implicitly in the compiled program. Export them
-after the shared reductions have transformed it; do not propagate a second set
-of forward matrices through every expression reduction. The new work in earlier
-reductions is principally to expose their parameter-coordinate and recovery
-operators.
+Trace IDs with the existing chain helpers and compose sparse operators for
+packing, scaling, and scattering. Recovery from several auxiliary constraints
+selects from their combined dual blocks. Reuse these operators in `invert()` so
+numerical and exported recovery share an implementation.
 
-For example, `PSDToSvecPSD` already constructs the solver-aware PSD transformation
-and recovers its dual in `ExactCone2Cone`. Expose that local operator there,
-including its transpose where appropriate. SCS and Clarabel adapters should not
-independently reconstruct PSD scaling or unpacking. Likewise, `ConeFormat` should
-own interleaving and its inverse, rather than each adapter implementing them.
+Solver interfaces specify their final layout operations using shared utilities
+for selection, permutation, signs, stacking, and constant insertion. These
+utilities transform values maps and sparse structures together. They operate on
+the program produced by the resolved chain: conic interfaces receive formatted
+rows; QP interfaces receive unformatted rows. PSD scaling and cone interleaving
+remain in the reductions that perform them.
 
-Use the existing chain ID-composition helpers for identity tracing. Add numerical
-operators for packing, scaling, scattering, and recovery from multiple auxiliary
-constraints: ID maps alone cannot express these. Construct operators from the
-same metadata as `invert()`, ideally sharing the operator implementation with
-numerical inversion. Do not infer them by probing `invert()` on basis vectors.
+## Contract
 
-## Keep the adapter declarative
+- **Affine maps:** `maps[name] = (M, v)` gives `M @ p + v`. `M` contains finite
+  coefficients. Constant infinite bounds appear only in `v`, with zero rows in
+  `M`; parameter adjoints use `M.T`.
+- **Parameter storage:** `p` concatenates compact blocks with no constant
+  sentinel. Sparse parameters contribute stored entries; symmetric parameters
+  use the compiled triangular packing. Each block records its original ID,
+  logical shape, packed size, offset, and entry order. Packing and its adjoint
+  operate on stored entries without densification. Dense blocks use Fortran order.
+- **Matrix storage:** Declare CSC/CSR structure and triangle for each matrix
+  input. Preserve structural slots across parameter values, including evaluated
+  zeros. Export native bounds and fixed cone data consumed by the solver.
+- **Recovery:** Record original variable IDs, shapes, and output offsets. Each
+  `constraint.dual_variables` object gets an entry carrying its parent constraint
+  ID. Reshape slices in Fortran order. Specify the native solver output blocks
+  concatenated into `solver_x` and `solver_y`.
+- **Selection:** `variables=None` selects all original primal variables and
+  explicit constraint duals; a list selects outputs in caller order within each
+  recovery vector. An empty list requests forward maps only. Construct only
+  requested recovery rows. Raise an error for unsupported requested recovery.
 
-A shared layout utility should apply selections, permutations, signs, stacks,
-and constant insertion to both affine maps and sparse structures. An adapter
-provides the recipe; it does not inspect `reduced_A` or trace upstream inverse
-data. This utility is an implementation detail, not another public API.
-
-For SCS and Clarabel, the remaining forward work is largely naming, the final
-constraint-matrix sign, and matrix storage. ECOS additionally splits equality
-and conic rows. OSQP stacks equality and inequality rows and inserts constant
-infinite lower bounds. These operations need no separate map-extraction code.
-
-The recipe is relative to the actual compiled program: conic adapters receive
-formatted rows; QP adapters receive unformatted rows. Reuse the resolved chain,
-`SolverInfo`, and compilation options. Do not normalize the problem a second
-time or redo PSD conversion in the terminal layout utility.
-
-## Public contract
-
-- **Forward maps:** `maps[name] = (M, v)` means `values = M @ p + v`.
-  `M` has finite entries. Infinite bound constants belong only in `v`, with zero
-  corresponding rows in `M`. The parameter adjoint uses `M.T`, excluding `v`.
-- **Coordinates:** `p` uses the compact parameter coordinates chosen by
-  compilation, with no trailing constant. Sparse parameters contribute only
-  stored entries; symmetric parameters use the compiled triangular packing.
-  Expose each block's original parameter ID, logical shape, packed size, offset,
-  and exact entry order. Packing and its adjoint must work directly on stored
-  entries, without allocating dense parameters or dense packing matrices.
-  Unstructured dense parameters retain Fortran order.
-- **Structure:** Matrix values follow an explicitly declared CSC/CSR structure
-  and triangle. Structural slots remain fixed across parameter assignments,
-  including coefficients that evaluate to zero. Bound maps and fixed cone data
-  must be included whenever the solver consumes them.
-- **Recovery:** Return original-variable IDs, shapes, and output offsets. Use one
-  dual entry per object in `constraint.dual_variables`, also carrying its parent
-  constraint ID. Reshape output slices in Fortran order. Adapters specify how
-  native output blocks form `solver_x` and `solver_y`.
-- **Selection:** `variables=None` requests all original primal variables and
-  explicit constraint duals; a list selects outputs, preserving relative order
-  within each recovery vector. `variables=[]` requests forward maps only.
-  Unsupported requested recovery raises an explicit error.
-
-`Problem` is the public entry point; chain composition is internal. Cache against
-the actual compilation and parameter layout, independently of parameter values.
-Output selection should not require constructing every recovery row. Returned
-maps must not expose mutable aliases into cached tensors.
-
-## Implementation scope
-
-Start by exporting the compiled-program maps, adding local recovery operators to
-the shared reductions needed by SCS/Clarabel, and composing them in the chain.
-Add OSQP/ECOS through layout recipes. Each adapter can opt in; the existing solve
-path remains available.
-
-Compare evaluated inputs with the numerical adapter path and structural recovery
-with chain inversion before attribute projection. Cover PSD conventions,
-auxiliary-constraint recovery, zero crossings, parameter packing, bounds, output
-selection, and adjoint identities. These are equivalence checks for the maps,
-not tests of the solver's implicit derivative.
-
-CVXPYgen and CVXPYlayers then replace their extraction/recovery bookkeeping.
-Their solver calls, code generation, framework operations, and derivative
-machinery remain. Reusing the same operators in CVXPY's numerical solve path
-can follow incrementally.
+Parameter value changes reuse the compiled maps. Exported arrays must not alias
+mutable cached tensors.
 
 ## Decisions for review
 
-1. **Recovery scope:** Start with separate primal/dual maps and reject chains
-   requiring cross-recovery, or expose a block operator on `[solver_x; solver_y]`
-   immediately? Forward-only requests should remain usable when recovery is
-   unsupported.
-2. **Initial coverage:** Which cone conversions, direct-cone paths, and compiled
-   program representations must support export in the first version? Should
-   nonlinear parameter or recovery transformations, such as DGP's logs and
-   exponentials, be exposed separately or left unsupported initially?
+1. **Recovery interface:** Keep separate primal and dual maps, or use one block
+   operator on `[solver_x; solver_y]` to accommodate reductions that exchange
+   primal and dual roles?
+2. **Coverage:** Is SCS/Clarabel with the stuffed-tensor representation sufficient
+   initially, or must the first version include OSQP/ECOS, direct-cone recovery,
+   and other `ParamProb` representations? For DGP, expose logs and exponentials
+   as separate parameter/recovery transformations or defer support?
 
 ## Appendix: contract sketch
-
-These types illustrate the returned data; names and metadata types are provisional.
-The main proposal does not require a particular internal layout-recipe DSL.
 
 ```python
 @dataclass
@@ -194,22 +142,16 @@ class CanonicalMaps:
     solver_metadata: dict[str, object]
 ```
 
-`M` has shape `(number_of_output_values, total_param_size)`. Its CSR format is
-independent of the output matrix's CSC/CSR format. Metadata specifies cone order,
-fixed cone parameters, primal/dual input lengths, and native output block order.
-Missing objectives or bounds follow the adapter's declared input contract.
-Empty recovery selections have zero rows; scalars have shape `()` and size one.
-The `d` map is the compiled objective offset, not a solver input; recovering an
-original maximization objective also requires its sign.
+`M.shape == (number_of_output_values, total_param_size)`; its CSR format is
+independent of the output matrix format. `solver_metadata` supplies cone order,
+fixed cone parameters, vector lengths, and native output block order. The `d` map
+contains the compiled objective offset; original-objective recovery also needs
+the maximization/minimization sign.
 
-`param_id_to_size` and `total_param_size` count packed entries, not logical
-parameter elements. `ParameterInfo.indices` records the compilation's actual
-packing order; consumers must not infer a triangle ordering from shape alone.
-Already-packed inputs can be concatenated directly. For logical inputs, packing
-gathers the declared entries and its adjoint accumulates cotangents into those
-input coordinates using sparse storage when applicable. It does not implicitly
-duplicate off-diagonal cotangents into a full symmetric matrix. Any framework
-conversion to a different gradient representation must be explicit.
+`param_id_to_size` and `total_param_size` count packed entries.
+`ParameterInfo.indices` gives their logical indices in packing order. The packing
+adjoint scatters cotangents into those coordinates without duplicating
+off-diagonal cotangents into a full symmetric matrix.
 
 ### Example adapter layouts
 
@@ -219,7 +161,7 @@ linear objective `c`; Clarabel names it `q`. PSD scaling and cone interleaving
 have already happened upstream.
 
 For OSQP's unformatted program, let its coefficients be `AF, bg` with equality
-rows first. Its recipe reproduces the existing QP adapter and OSQP input assembly:
+rows first:
 
 ```text
 A_eq =  AF[:n_eq]       b_eq = -bg[:n_eq]
@@ -230,11 +172,9 @@ l = [b_eq; -inf]
 u = [b_eq; g]
 ```
 
-Infinite entries have zero parameter-map rows. Triangular extraction of `P` and
-CSC/CSR conversion must transform its values map and structure together. The
-same holds for stacking, row selection, and duplicate consolidation. Native
-bounds that are retained by compilation require their own map entries; bounds
-lowered into constraints are already represented there.
+Triangular extraction of `P`, CSC/CSR conversion, and duplicate consolidation
+must transform both the values map and sparse structure. Bounds
+lowered into constraints are already represented in the constraint maps.
 
 ### Source snapshots
 
