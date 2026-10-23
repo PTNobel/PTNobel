@@ -30,10 +30,6 @@ primal_flat = canon.R_primal @ solver_x
 dual_flat = canon.R_dual @ solver_y
 ```
 
-Initial coverage is supported continuous, real DPP compilations with linear recovery. DGP transformations,
-attribute projection, and differentiation through the solver are outside this
-contract.
-
 ## Construction belongs with the transformation
 
 | Owner | Responsibility |
@@ -136,7 +132,9 @@ can follow incrementally.
    immediately? Forward-only requests should remain usable when recovery is
    unsupported.
 2. **Initial coverage:** Which cone conversions, direct-cone paths, and compiled
-   program representations must support export in the first version?
+   program representations must support export in the first version? Should
+   nonlinear parameter or recovery transformations, such as DGP's logs and
+   exponentials, be exposed separately or left unsupported initially?
 
 ## Appendix: contract sketch
 
