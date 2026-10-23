@@ -86,8 +86,7 @@ solver output layout and the reductions' recovery metadata. It uses the chain's
 existing variable and constraint ID maps to trace requested objects, and composes
 the sparse versions of their slicing, expansion, permutation, and scaling
 operations. The reductions retain those numerical operations beside their
-existing recovery implementations. A solver interface supplies its native
-output layout; it does not reconstruct upstream attribute or cone conversions.
+existing recovery implementations.
 
 For example, `ExactCone2Cone` already owns PSD-to-svec conversion and full-matrix
 dual recovery using `SolverInfo`. Its recovery supplies the corresponding block
