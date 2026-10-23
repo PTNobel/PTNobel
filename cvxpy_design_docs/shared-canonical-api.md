@@ -8,8 +8,8 @@ ChatGPT generated:
 
 ## Proposal
 
-Add `Problem.get_canonical_maps()` to expose affine parameter-to-solver-data maps
-and primal/dual recovery matrices for CVXPYgen and CVXPYlayers.
+`Problem.get_canonical_maps()` returns affine parameter-to-solver-data maps and
+primal/dual recovery matrices for CVXPYgen and CVXPYlayers.
 
 ```python
 canon = problem.get_canonical_maps(
@@ -25,46 +25,57 @@ dual_flat = canon.R_dual @ solver_y
 
 ## Map construction
 
-The compiled program exports forward maps. Each reduction exposes its parameter-packing
-and recovery operators. `SolvingChain` composes those operators to recover the
-requested outputs. Each reduction's `invert()` method uses the same recovery
-operators, including those that combine duals from multiple auxiliary constraints.
+The proposal adds affine-map export to the compiled `ParamProb` representation.
+Each reduction exposes sparse operators for the parameter packing and solution
+recovery it performs. `SolvingChain` composes those operators and the exported
+maps. The reductions' `invert()` methods use the same recovery operators,
+including those that combine duals from multiple auxiliary constraints.
 
-Solver interfaces specify the remaining signs, row splits/stacks, triangular
-extraction, and CSC/CSR ordering using shared layout utilities. Apply each
-operation to both the values map and sparse structure.
+Each solver interface specifies its final signs, row splits/stacks, triangular
+extraction, CSC/CSR ordering, and native output blocks. Shared layout utilities
+apply these operations to both the values maps and sparse structures.
+`Problem.get_canonical_maps()` compiles the problem or reuses its cached
+compilation, then packages the chain's result as `CanonicalMaps`.
 
 ## Contract
 
-- **Affine maps:** `maps[name] = (M, v)` gives `M @ p + v`. `M` contains finite
-  coefficients. Constant infinite bounds appear only in `v`, with zero rows in
-  `M`.
-- **Parameter storage:** `p` concatenates compact blocks with no constant
-  sentinel. Sparse parameters contribute stored entries; symmetric parameters
-  use the compiled triangular packing. Each block records its original ID,
-  logical shape, packed size, offset, and entry order. Packing and its adjoint
-  operate on stored entries without densification. Dense blocks use Fortran order.
-- **Matrix storage:** Declare CSC/CSR structure and triangle for each matrix
-  input. Preserve structural slots across parameter values, including evaluated
-  zeros. Export native bounds and fixed cone data consumed by the solver.
-- **Recovery:** Record original variable IDs, shapes, and output offsets. Each
-  `constraint.dual_variables` object gets an entry carrying its parent constraint
-  ID. Reshape slices in Fortran order. Specify the native solver output blocks
-  concatenated into `solver_x` and `solver_y`.
-- **Selection:** `variables=None` selects all original primal variables and
-  explicit constraint duals; a list selects outputs in caller order within each
-  recovery vector. An empty list requests forward maps only. Construct only
-  requested recovery rows. Raise an error for unsupported requested recovery.
+- **Affine maps:** The program exporter produces `(M, v)` pairs with finite
+  coefficients in `M`. The layout utilities insert constant infinite bounds
+  into `v` and zero rows into `M`. Callers evaluate `maps[name]` as `M @ p + v`.
+- **Parameter storage:** `SolvingChain` records each original parameter's ID,
+  logical shape, packed size, offset, and entry order in `parameter_layouts`.
+  Callers assemble `p` by concatenating these compact blocks without a constant
+  sentinel. Sparse blocks contain stored entries; symmetric blocks use the
+  compiled triangular packing; dense blocks use Fortran order. The reductions'
+  packing operators and their adjoints work on stored entries without densification.
+- **Matrix storage:** The program exporter preserves structural slots across
+  parameter values, including evaluated zeros. The layout utilities produce
+  `MatrixStructure` entries with the solver's CSC/CSR ordering and triangle.
+  The solver interface identifies native bound inputs and fixed cone data;
+  `SolvingChain` includes their maps and metadata in the result.
+- **Recovery:** `SolvingChain` constructs the requested recovery rows and records
+  original IDs, shapes, and offsets in `primal_vars` and `dual_vars`. It creates
+  one dual entry per `constraint.dual_variables` object, with its parent constraint
+  ID. The solver interface defines the native output blocks that callers
+  concatenate into `solver_x` and `solver_y`. Callers reshape recovered slices
+  in Fortran order.
+- **Selection:** `Problem.get_canonical_maps()` passes the requested outputs to
+  `SolvingChain`: `None` requests all original primal variables and explicit
+  constraint duals, a list requests those outputs in caller order within each
+  recovery vector, and an empty list requests forward maps only.
+  `Problem.get_canonical_maps()` raises an error if the chain cannot recover a
+  requested output.
 
 ## Decisions for review
 
-1. **Recovery interface:** Keep separate primal and dual maps, or use one block
-   operator on `[solver_x; solver_y]` to accommodate reductions that exchange
-   primal and dual roles?
-2. **Coverage:** Is SCS/Clarabel with the stuffed-tensor representation sufficient
-   initially, or must the first version include OSQP/ECOS, direct-cone recovery,
-   and other `ParamProb` representations? For DGP, expose logs and exponentials
-   as separate parameter/recovery transformations or defer support?
+1. **Recovery interface:** Should `SolvingChain` return separate primal and dual
+   maps, or one block operator on `[solver_x; solver_y]` for reductions that
+   exchange primal and dual roles?
+2. **Coverage:** Can the first implementation target SCS/Clarabel and the
+   stuffed-tensor representation, or must it also export OSQP/ECOS inputs,
+   direct-cone recovery, and other `ParamProb` representations? Should
+   `Dgp2Dcp` expose its logs and exponentials as separate parameter/recovery
+   transformations in that implementation?
 
 ## Appendix: contract sketch
 
@@ -121,12 +132,15 @@ class CanonicalMaps:
     solver_metadata: dict[str, object]
 ```
 
-`param_id_to_size` and `total_param_size` count packed entries.
-`ParameterInfo.indices` records the gather order; its adjoint scatters into those
-coordinates without duplicating symmetric off-diagonal cotangents.
-`solver_metadata` supplies cone order, fixed cone parameters, vector lengths,
-and native output block order. The `d` map contains the compiled objective offset;
-original-objective recovery also needs the maximization/minimization sign.
+`SolvingChain` sets `param_id_to_size` and `total_param_size` from packed block
+sizes and records the packing operators' gather order in `ParameterInfo.indices`.
+The packing adjoints scatter cotangents into those coordinates without duplicating
+symmetric off-diagonal cotangents.
+
+The solver interface supplies cone order, fixed cone parameters, vector lengths,
+and native output block order for `solver_metadata`. The program exporter supplies
+the compiled objective offset as the `d` map; `SolvingChain` records the
+maximization/minimization sign in `solver_metadata` for objective recovery.
 
 ### Source references
 
