@@ -49,12 +49,11 @@ through the solve remain downstream responsibilities.
 
 ### What has changed since the original draft
 
-- **CVXPY:** `ConeFormat` is now an explicit reduction before conic solver
-  interfaces. `ConicSolver.apply()` expects formatted rows;
-  `format_constraints()` is a deprecated compatibility wrapper. QP interfaces
-  consume unformatted rows and apply their own equality/inequality signs.
-  PSD triangle selection and scaling must follow the compilation's solver
-  conventions rather than be attributed entirely to `format_constraints()`.
+- **CVXPY:** Solver selection and canonicalization now use `ProblemForm` and
+  `SolverInfo`, with a shared cone-stuffing path for QP and conic interfaces.
+  `ConeFormat` is an explicit reduction before conic interfaces;
+  `format_constraints()` is a deprecated compatibility wrapper. The API must
+  reuse this solver-aware chain, as described below.
 - **CVXPYgen:** Solver adapters now live in `cvxpygen/solvers/`, with shared
   affine-map extraction in `_interface.py`. `Canonicalizer` in
   `canonicalizer.py` owns parameter and recovery extraction. It already uses
@@ -70,6 +69,42 @@ through the solve remain downstream responsibilities.
 
 These observations refer to the source snapshots linked at the end, rather than
 to a particular released version.
+
+### Fit with the restructured solving chain
+
+`resolve_and_build_chain()` validates the problem and constructs its `ProblemForm`,
+resolves a solver using structural capability checks, and delegates to
+`_build_solving_chain()`. That builder separates pre-canonicalization rewrites
+from canonicalization driven by the problem form, DPP handling, and `SolverInfo`.
+The latter carries supported constraints, native-bound support, PSD triangle and
+scaling conventions, and direct-cone capabilities into the reductions.
+
+Both QP and conic interfaces now use the common path:
+
+```text
+Pre-canonicalization rewrites and DPP handling
+  → Dcp2Cone(quad_obj, solver_context)
+  → CvxAttr2Constr(reduce_bounds)
+  → [ExactCone2Cone] → [ApproxCone2Cone]
+  → EliminateZeroSized → [SOCDim3]
+  → ConeMatrixStuffing(quad_obj, canon_backend)
+  → [ExtractDirectCones]
+  → [ConeFormat: conic interfaces only]
+  → solver adapter
+```
+
+Bracketed steps are conditional. QP interfaces receive unformatted rows and
+apply their own equality/inequality signs; conic interfaces receive formatted
+rows. Whether the objective retains a `P` matrix depends on solver support and
+compilation options. PSD representation and native bounds are likewise decided
+upstream, not reconstructed independently by each map consumer.
+
+`get_canonical_maps()` should consume the resolved chain and its compiled program,
+not build a parallel canonicalization pipeline or assume a separate QP-stuffing
+branch. The chain's `compose_var_id_map()`, `compose_param_id_map()`, and
+`compose_constr_id_map()` already provide ID tracing. They are the starting point
+for map composition, although IDs alone do not encode packing, scaling, or the
+numerical recovery operators.
 
 ## Public API
 
@@ -274,8 +309,10 @@ adapter's recovery with the applicable reductions, including variable attribute
 lowering, constraint ID mappings, and cone conversions.
 
 Build these maps structurally from reduction metadata and local recovery
-operators. Do not probe `invert()` on basis vectors: that would be expensive,
-would execute status-dependent code, and would not establish linearity.
+operators, reusing the chain's existing ID-composition helpers. Add numerical
+operators where ID tracing is insufficient. Do not probe `invert()` on basis
+vectors: that would be expensive, would execute status-dependent code, and would
+not establish linearity.
 
 Typical local operators include:
 
@@ -312,7 +349,9 @@ and nonlinear inverse transformations are outside this linear recovery contract.
    expose composable recovery information. An unsupported internal hook may
    return `NotImplemented`; the public API raises a descriptive error.
 2. **Add `Problem.get_canonical_maps()`.** Reuse the compilation chain, compose
-   parameter coordinates and recovery, and select requested outputs. Construct
+   parameter coordinates and recovery using its existing ID maps, and select
+   requested outputs. Preserve the resolved `SolverInfo` and compilation choices;
+   do not rerun solver selection or choose cone conversions separately. Construct
    selected recovery rows directly where practical. Returned arrays must not
    alias mutable cached tensors that a downstream library can reorder.
 3. **Start with SCS and Clarabel, then OSQP and ECOS.** Support each solver only
@@ -381,6 +420,10 @@ compilation conventions downstream.
 Reviewed against upstream sources on October 23, 2026:
 
 - **CVXPY** ([`8280648`](https://github.com/cvxpy/cvxpy/tree/8280648bd1f70fce701d362de4f58120f940c2f3)):
+  [chain construction](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/solving_chain.py),
+  [problem form](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/problems/problem_form.py),
+  [solver context](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/utilities/solver_context.py),
+  [chain ID composition](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/chain.py),
   [cone formatting](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cone_format.py),
   [conic adapter](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/conic_solvers/conic_solver.py),
   [QP adapter](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/qp_solvers/qp_solver.py),
