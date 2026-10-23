@@ -30,8 +30,7 @@ primal_flat = canon.R_primal @ solver_x
 dual_flat = canon.R_dual @ solver_y
 ```
 
-This is a proposed API, not existing functionality. Initial coverage is supported
-continuous, real DPP compilations with linear recovery. DGP transformations,
+Initial coverage is supported continuous, real DPP compilations with linear recovery. DGP transformations,
 attribute projection, and differentiation through the solver are outside this
 contract.
 
