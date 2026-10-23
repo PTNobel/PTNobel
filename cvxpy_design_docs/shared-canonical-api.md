@@ -54,8 +54,9 @@ reduced parameters for sparse, diagonal, and symmetric attributes;
 `Chain.compose_param_id_map()` traces original IDs to lists of compiled IDs.
 The reduction's value transformation determines the entries of each compiled
 block. In particular, sparse parameters contribute their stored entries, without
-densification. The ID correspondence does not specify offsets or replace the
-existing `update_parameters()`, `param_forward()`, and `param_backward()` hooks.
+densification. The ID correspondence is separate from vector offsets. The
+reductions handle parameter updates and derivatives through `update_parameters()`,
+`param_forward()`, and `param_backward()`.
 
 `R_primal` and `R_dual` map the solver's primal and dual vectors to concatenated
 original-variable values. `VarInfo` and `DualInfo` identify each output's ID,
@@ -72,28 +73,25 @@ right-hand-side, and bound maps. The solver's internal `get_canonical_maps()`
 method applies the remaining signs, row splits, and storage conversions used by
 its numerical adapter. SCS and Clarabel share the base conic extraction; ECOS
 splits equality and conic rows; OSQP assembles `A`, `l`, and `u` from the QP
-blocks. The base method returns `NotImplemented` until an interface supports it.
+blocks.
 
 The shared reductions have already applied solver-aware PSD conversion and cone
-layout before conic map extraction. The exporter reads those transformed
-coefficients. It does not repeat PSD scaling or row interleaving in each solver
-interface. QP extraction follows `QpSolver.apply()`'s signs on its unformatted
-program. Each matrix-storage conversion transforms the values map and its
+layout before conic map extraction. QP extraction follows `QpSolver.apply()`'s
+signs on its unformatted program. Each matrix-storage conversion transforms the values map and its
 indices together.
 
-`Problem.get_canonical_maps()` constructs original-output recovery from the
+`Problem.get_canonical_maps()` constructs recovery of original outputs from the
 solver output layout and the reductions' recovery metadata. It uses the chain's
 existing variable and constraint ID maps to trace requested objects, and composes
 the sparse versions of their slicing, expansion, permutation, and scaling
-operations. The reductions retain those numerical operations beside their
-existing recovery implementations.
+operations.
 
 For example, `ExactCone2Cone` already owns PSD-to-svec conversion and full-matrix
 dual recovery using `SolverInfo`. Its recovery supplies the corresponding block
 of `R_dual`. Symmetric primal expansion comes from attribute lowering and has
 unscaled off-diagonal entries; scaled PSD dual recovery uses `1/sqrt(2)` entries.
-Those are different operators. Cone conversions involving auxiliary constraints
-must contribute the recovery from those constraints as well as the ID mapping.
+Cone conversions involving auxiliary constraints contribute their dual-recovery
+operators as well as their ID mappings.
 
 ## Constant offsets
 
@@ -103,26 +101,37 @@ in `M` and `-inf` entries in `v`. A cotangent application uses `M.T` without
 multiplying by the infinite constants. CVXPYgen can initialize constant entries
 once instead of recomputing them on parameter updates.
 
-## Downstream adoption
+## Incremental adoption
 
-CVXPYgen replaces affine-map extraction in `cvxpygen/solvers/_interface.py` and
-primal/dual extraction in `canonicalizer.py`. It retains solver code generation,
-settings, update adjacency, and its derivative machinery. The current
-canonicalizer already uses `compose_var_id_map()` for primal IDs and traverses
-inverse data for dual IDs; the proposal removes its remaining dependence on
-canonical offsets and constraint layout.
+CVXPY can migrate its numerical solve path one solver interface at a time.
+The base `get_canonical_maps()` returns `NotImplemented`. CVXPY caches either
+that sentinel or the interface's maps with the compilation:
 
-CVXPYlayers replaces its direct reduced-tensor access and per-framework recovery
-bookkeeping. Its current `get_solver_ctx()` already permutes non-DIFFCP maps
-into CSR value order at construction; evaluated-value adapters still perform
-sign changes and vector extraction. The new maps absorb those operations.
-CVXPYlayers retains framework conversion, batching, solver/derivative calls,
-and GP transformations.
+- When the interface returns maps, CVXPY evaluates them to produce solver inputs.
+- When the interface returns `NotImplemented`, CVXPY calls its existing `apply()`.
 
-CVXPY can keep its existing numerical solve path while downstream libraries
-adopt the API. If CVXPY later evaluates these maps internally, it can cache them
-with compilation and fall back to `apply()` for interfaces returning
-`NotImplemented`.
+Each converted interface shares its map construction between CVXPY's solve path
+and downstream callers.
+
+### Migration plan
+
+1. **CVXPY adds the API.** The base conic implementation covers SCS/Clarabel;
+   OSQP and ECOS supply their splitting and storage adaptations. CVXPY tests
+   compare map evaluation with the existing numerical adapter inputs and compare
+   recovery with the reduction chain's recovery.
+2. **CVXPYlayers adopts the maps.** It replaces direct reduced-tensor access and
+   per-framework recovery bookkeeping. The returned maps incorporate the signs,
+   vector extraction, and storage ordering its adapters currently perform.
+   CVXPYlayers retains framework conversion, batching, solver/derivative calls,
+   and GP transformations.
+3. **CVXPYgen adopts the maps.** It replaces affine-map extraction in
+   `cvxpygen/solvers/_interface.py` and primal/dual extraction in
+   `canonicalizer.py`. It retains solver code generation, settings, update
+   adjacency, and derivative machinery.
+4. **CVXPY deprecates downstream reliance on internal tensors.** After both
+   libraries have migrated, CVXPY documents `reduced_A.reduced_mat`, `q`, and
+   related tensor/layout access as implementation details and directs downstream
+   callers to `get_canonical_maps()`.
 
 ## Open questions
 
@@ -130,7 +139,7 @@ with compilation and fall back to `apply()` for interfaces returning
   both paths share their construction? `ParamConeProg.apply_param_jac()` returns
   derivatives in compiled-parameter coordinates and rejects quadratic objectives;
   `Problem.backward()` separately applies the reductions' `param_backward()`
-  hooks. Any shared implementation must preserve that coordinate boundary.
+  hooks.
 - **PSD output:** Should callers also be able to request packed PSD duals, in
   addition to the proposed full-matrix recovery?
 - **Dual grouping:** The sketch uses one entry per dual variable. CVXPYgen
