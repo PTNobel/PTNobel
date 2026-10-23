@@ -25,10 +25,10 @@ dual_flat = canon.R_dual @ solver_y
 
 ## Map construction
 
-Export forward maps from the final compiled program. Add sparse parameter-packing
-and recovery operators alongside the reductions' `invert()` implementations;
-compose them in `SolvingChain`. Share the recovery operators with numerical
-inversion, including recovery from multiple auxiliary constraint duals.
+The compiled program exports forward maps. Each reduction exposes its parameter-packing
+and recovery operators. `SolvingChain` composes those operators to recover the
+requested outputs. Each reduction's `invert()` method uses the same recovery
+operators, including those that combine duals from multiple auxiliary constraints.
 
 Solver interfaces specify the remaining signs, row splits/stacks, triangular
 extraction, and CSC/CSR ordering using shared layout utilities. Apply each
