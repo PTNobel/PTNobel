@@ -1,598 +1,396 @@
-# Design Doc: Shared Canonical Parameter API for CVXPY
+ChatGPT generated:
 
-## Status: Draft
+# Shared canonical parameter API for CVXPY
 
-## Authors
-Claude Opus 4.6, with prompting from Parth Nobel
+**Status:** Draft proposal; the API below is not implemented in the sources reviewed here.  
+**Updated:** October 23, 2026.  
+**Original authors:** Claude Opus 4.6, with prompting from Parth Nobel.  
+**Revision:** ChatGPT, with prompting from Parth Nobel.  
+**Reviewer:** Max Schaller.
 
-## Reviewers
-Max Schaller
+## Proposal in brief
 
-## Summary
+Expose the affine maps that CVXPY compiles between a problem's parameters and a
+solver's numerical inputs, together with sparse maps for recovering requested
+primal and dual variables. CVXPYgen can generate code from these maps;
+CVXPYlayers can evaluate them in its tensor framework.
 
-CVXPY should expose a public API on its solver interfaces that provides
-**compiled parametric affine maps** from user parameters to
-solver-specific canonical parameters (P, q, A, b, etc.). This would
-upstream the map-construction logic currently duplicated in CVXPYgen's
-`solvers.py` and allow CVXPYlayers to drastically simplify its solver
-interface layer.
+For a fixed compilation and a packed parameter vector `p`, the contract is:
 
-## Background
-
-### The Problem Both Libraries Solve
-
-Both CVXPYgen and CVXPYlayers consume CVXPY's `ParamConeProg`, the
-internal representation of a compiled DPP-compliant problem. A
-`ParamConeProg` stores three sparse "tensor" matrices that encode affine
-maps from a flat parameter vector to problem data:
-
-```
-reduced_P.reduced_mat @ param_vec  -->  P values (CSC-ordered)
-q                     @ param_vec  -->  [c; d]  (objective + constant offset)
-reduced_A.reduced_mat @ param_vec  -->  values of augmented [A | b] (CSC-ordered)
+```text
+solver input k:    values[k] = M[k] @ p + v[k]
+primal recovery:  primal_flat = R_primal @ solver_x
+dual recovery:    dual_flat   = R_dual   @ solver_y
 ```
 
-Both libraries then need to go from these raw data vectors to
-solver-specific inputs. Every solver has a different convention:
+Matrix inputs also carry their sparse storage layout. Recovery outputs carry
+IDs, shapes, and offsets into the flat vectors. The public entry point belongs
+on `Problem`: only that layer has enough information to compose recovery through
+the entire reduction chain.
 
-| Solver   | Form                                                       | Canonical params      |
-|----------|------------------------------------------------------------|-----------------------|
-| SCS      | min. $\tfrac{1}{2}x^\top Px + c^\top x$ s.t. $Ax + s = b,s \in K$ | $P, c, d, A, b$ |
-| Clarabel | min. $\tfrac{1}{2}x^\top Px + q^\top x$ s.t. $Ax + s = b,s \in K$ | $P, q, d, A, b$ |
-| ECOS     | min. $c^\top x$ s.t. $Ax = b,Gx \le_K h$               | $c, d, A, b, G, h$    |
-| OSQP     | min. $\tfrac{1}{2}x^\top Px + q^\top x$ s.t. $l \le Ax \le u$ | $P, q, d, A, l, u$ |
+This proposal covers the affine portion of compilation and solution recovery for
+supported continuous, real, DPP problems. It does not claim that solving a problem,
+differentiating its solution, or every CVXPY reduction is linear.
 
-The conversion from the raw `ParamConeProg` tensors to these
-solver-specific parameters involves:
+## Why CVXPY should own this
 
-1. **Splitting** the augmented constraint matrix `[A | b]` into matrix
-   and vector parts.
-2. **Sign correction** (CVXPY stores `Ax + b in K`; solvers typically
-   want `Ax + s = b` or `Ax <= b`, requiring negation of A).
-3. **Equality/inequality splitting** for solvers that distinguish them
-   (ECOS: A/b vs G/h; OSQP: bounds l/u).
-4. **Structural formatting** (PSD scaling, SOC reordering) via
-   `format_constraints()`.
-5. **Matrix format conversion** (CSC vs CSR) depending on the solver.
+CVXPY already compiles parametric problem data, but downstream libraries must
+interpret internal tensors and repeat parts of the solver adapter:
 
-### How This Is Done Today
+| Library | Current responsibility that this API would absorb |
+| --- | --- |
+| CVXPY | Evaluate parameter tensors, apply solver signs and layouts, and invert reductions. |
+| CVXPYgen | Extract per-input affine maps and trace primal/dual recovery information. |
+| CVXPYlayers | Adapt parameter tensors to solver storage and reconstruct requested outputs in each framework. |
 
-**In CVXPY itself**: The solver `apply()` methods do steps 1-4 for
-concrete numerical values. `ConicSolver.apply()` calls
-`apply_parameters()` to get `(c, d, A, b)`, then negates A.
-`QpSolver.apply()` additionally splits equality/inequality rows.
-`format_constraints()` handles structural formatting. But these all
-operate on evaluated numbers, not on the parametric affine maps.
+The shared API should make CVXPY the source of truth for these transformations.
+Code generation, tensor frameworks, batching, solver calls, and differentiation
+through the solve remain downstream responsibilities.
 
-**In CVXPYgen**: The `SolverInterface.get_affine_map()` method
-(in `solvers.py`) reimplements the same logic, but on the
-parametric affine maps. For each canonical parameter (P, q, A, b, etc.),
-it extracts the relevant rows from `reduced_P.reduced_mat`,
-`param_prob.q`, and `reduced_A.reduced_mat`, applies sign corrections,
-and produces a per-parameter affine map:
-`p_id_to_mapping[p_id] @ param_vec = canonical_param_values`. This is
-the core logic that could be upstreamed.
+### What has changed since the original draft
 
-**In CVXPYlayers**: Each solver interface independently reconstructs
-the augmented `[A | b]` matrix, splits off `b`, negates `A`, and
-converts to the solver's preferred format at `CvxpyLayer`
-construction time.
+- **CVXPY:** `ConeFormat` is now an explicit reduction before conic solver
+  interfaces. `ConicSolver.apply()` expects formatted rows;
+  `format_constraints()` is a deprecated compatibility wrapper. QP interfaces
+  consume unformatted rows and apply their own equality/inequality signs.
+  PSD triangle selection and scaling must follow the compilation's solver
+  conventions rather than be attributed entirely to `format_constraints()`.
+- **CVXPYgen:** Solver adapters now live in `cvxpygen/solvers/`, with shared
+  affine-map extraction in `_interface.py`. `Canonicalizer` in
+  `canonicalizer.py` owns parameter and recovery extraction. It already uses
+  `chain.compose_var_id_map()` for primal IDs and traverses inverse data for
+  dual IDs; the older description of all recovery as fixed
+  `inverse_data[-1..-4]` indexing is outdated. It still depends on internal
+  offsets, constraint ordering, and some positional inverse-data access.
+- **CVXPYlayers:** `get_solver_ctx()` pre-permutes reduced maps to CSR order
+  for its built-in non-DIFFCP paths. DIFFCP retains its CSC path. Structural
+  conversion is therefore already partly done at construction time, while
+  interfaces still adapt evaluated values for their solver. Recovery and
+  dimension-reducing parameter attributes require additional bookkeeping.
 
-### The Duplication
+These observations refer to the source snapshots linked at the end, rather than
+to a particular released version.
 
-The sign correction and splitting logic exists in **three places**:
+## Public API
 
-1. `cvxpy/reductions/solvers/conic_solvers/conic_solver.py` --
-   `apply()` negates A for concrete values
-2. `cvxpygen/solvers.py` -- `get_affine_map()` applies sign=-1 to the
-   affine map rows for A
-3. `cvxpylayers/interfaces/*.py` -- each solver reconstructs and negates
-   A from CSC values at construction time
+The following signatures describe the proposed contract; names remain open.
 
-## Proposal
+```python
+canon = problem.get_canonical_maps(
+    solver=cp.CLARABEL,
+    variables=[x, constraint.dual_variables[0]],
+    # Compilation options, as applicable to get_problem_data().
+)
 
-### Core Idea
+M, v = canon.maps["q"]
+q = M @ p + v
 
-Every operation in the CVXPY solve pipeline — from user parameters to
-solver inputs, and from solver outputs back to user variables — is a
-**linear operation** that can be represented as a sparse matrix
-multiply. CVXPY should expose the complete set of these matrices as
-a public API.
-
-The entire data flow becomes six sparse matmuls plus constant offsets:
-
-```
-Forward (parameters → solver inputs):
-    P_map  @ param_vec + P_offset  →  P values
-    q_map  @ param_vec + q_offset  →  q/c vector
-    A_map  @ param_vec + A_offset  →  A values     (sign-corrected)
-    b_map  @ param_vec + b_offset  →  b vector
-
-Recovery (solver outputs → user variables):
-    R_primal  @ solver_x  →  [var1_flat; var2_flat; ...]
-    R_dual    @ solver_y  →  [dual1_flat; dual2_flat; ...]
+M, v = canon.maps["A"]
+A_values = M @ p + v
+layout = canon.structures["A"]
+# Reconstruct A from A_values and layout, in the declared CSC or CSR order.
 ```
 
-The recovery matrices encode all normalization: slicing from
-`var_id_to_col`, symmetric svec-to-full expansion, PSD $1/\sqrt{2}$
-off-diagonal scaling, Fortran-order permutation — everything baked
-into constant sparse matrix entries computed once at compilation time.
+`variables=None` requests all original primal variables and all dual variables
+of explicit constraints. An explicit list requests only those outputs. Within
+each of `primal_vars` and `dual_vars`, entries retain the caller's relative
+order. Each entry identifies its source object, so callers can restore a mixed
+primal/dual request order. Unknown or unsupported outputs raise an error rather
+than disappear silently. Attribute-implied constraints do not acquire public
+dual variables merely because canonicalization introduces constraints for them.
 
-There are **zero nonlinear operations** in either direction. (The GP
-`exp()` transform is applied separately after recovery and is
-explicitly outside the linear pipeline.)
+An empty list requests forward maps only. Selection changes recovery rows, not
+the compiled optimization problem. It can avoid materializing large unneeded
+outputs, although the performance benefit depends on the framework and workload.
 
-### `CanonicalMaps` Dataclass
+### Returned data
 
 ```python
 @dataclass
-class CanonicalMaps:
-    """Complete set of sparse matrices for a compiled parametric problem.
-
-    Forward maps (parameter → solver input):
-        M @ param_vec + v = solver_input_values
-        where param_vec is the flat parameter vector (no trailing 1.0).
-
-    Recovery maps (solver output → user variables):
-        R @ solver_vec = user_variable_values (flat, concatenated)
-    """
-
-    # --- Forward maps (parameter → solver input) ---
-
-    # Per-canonical-parameter affine maps: (matrix, offset) pairs.
-    # Usage: maps[key][0] @ param_vec + maps[key][1] = values
-    maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
-    # e.g. {"P": (M, v), "q": (M, v), "d": (M, v), "A": (M, v), ...}
-
-    # Sparsity structure of output matrices (CSC format).
-    # For matrix params (P, A, G): (indices, indptr, shape).
-    structures: dict[str, tuple[np.ndarray, np.ndarray, tuple[int, int]]]
-
-    # --- Recovery maps (solver output → user variables) ---
-
-    # Primal recovery: R_primal @ solver_x → flat user variables.
-    # Encodes var_id_to_col slicing + symmetric unpacking.
-    R_primal: scipy.sparse.csr_array
-
-    # Dual recovery: R_dual @ solver_y → flat user duals.
-    # Encodes constraint slicing + PSD svec unpacking with 1/sqrt(2).
-    R_dual: scipy.sparse.csr_array
-
-    # Per-variable metadata for interpreting the flat output.
-    primal_vars: list[VarInfo]   # shape, offset into R_primal output
-    dual_vars: list[DualInfo]    # shape, offset into R_dual output,
-                                 # constraint_id, cone_type
-
-    # --- Problem metadata ---
-
-    cone_dims: ConeDims
-    constraints: list[Constraint]
-
-    # Parameter info
-    param_id_to_col: dict[int, int]
-    param_id_to_size: dict[int, int]
-    parameters: list[Parameter]
-    total_param_size: int
+class MatrixStructure:
+    format: Literal["csc", "csr"]
+    shape: tuple[int, int]
+    indices: np.ndarray
+    indptr: np.ndarray
+    triangle: Literal["full", "upper", "lower"]
 
 
 @dataclass
 class VarInfo:
-    """Metadata for one primal variable in the recovery output."""
     var_id: int
     shape: tuple[int, ...]
-    offset: int              # start index in R_primal output
-    size: int                # number of elements in output
-    is_symmetric: bool
+    offset: int
+    size: int
 
 
 @dataclass
 class DualInfo:
-    """Metadata for one dual variable in the recovery output."""
-    dual_var_id: int         # ID of the DualVariable object
+    dual_var_id: int
     constraint_id: int
     shape: tuple[int, ...]
-    offset: int              # start index in R_dual output
-    size: int                # number of elements in output
-    cone_type: str           # "zero", "nonneg", "soc", "psd", etc.
-    is_psd: bool
+    offset: int
+    size: int
+
+
+@dataclass
+class CanonicalMaps:
+    maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
+    structures: dict[str, MatrixStructure]
+
+    R_primal: scipy.sparse.csr_array
+    R_dual: scipy.sparse.csr_array
+    primal_vars: list[VarInfo]
+    dual_vars: list[DualInfo]
+
+    parameters: list[Parameter]
+    param_id_to_col: dict[int, int]
+    param_id_to_size: dict[int, int]
+    total_param_size: int
+
+    # Solver/cone metadata, including cone order and fixed cone parameters.
+    solver_metadata: dict[str, object]
 ```
 
-### `Problem.get_canonical_maps()` — User-Facing API
+Recovery metadata describes the result, so consumers need no `is_symmetric`,
+`is_psd`, or cone-type dispatch to interpret it. All output slices are reshaped
+in Fortran order, including matrix-valued duals. A scalar has shape `()` and
+size one. Empty recovery requests produce matrices with zero rows and metadata
+lists with no entries.
 
-The primary entry point for downstream libraries. Lives on `Problem`
-because it needs the compilation cache and the reduction chain's
-variable mappings:
+`solver_metadata` must specify primal and dual vector lengths, cone order, and
+how native solver outputs form `solver_x` and `solver_y`. If a solver returns
+separate equality and inequality dual vectors, their concatenation order is
+part of this contract. Recovery inputs use the solver API's returned coordinates,
+after any internal solver scaling has been undone.
 
-```python
-class Problem:
-    def get_canonical_maps(
-        self,
-        solver: str,
-        variables: list[Variable | DualVariable] | None = None,
-        *,
-        gp: bool = False,
-        # ... same compilation kwargs as get_problem_data()
-    ) -> CanonicalMaps:
-        """Return parametric affine maps for this problem.
+### Parameter coordinates
 
-        Compiles the problem (or uses the cached compilation) and
-        returns a CanonicalMaps with forward maps from parameters to
-        solver inputs and recovery maps from solver outputs to user
-        variables.
+The coordinate system must be public and independent of internal parameter IDs
+introduced by reductions. The proposed default is the concatenation of the
+original parameters in `canon.parameters` order, each flattened in Fortran order.
+`param_id_to_col` and `param_id_to_size` describe those blocks;
+`total_param_size` is their total length. There is no constant sentinel ID or
+trailing `1.0` in this public vector.
 
-        Parameters
-        ----------
-        solver : str
-            Target solver (e.g., cp.SCS, cp.CLARABEL).
-        variables : list, optional
-            Subset of Variable / DualVariable objects to include in
-            recovery. When None, all variables and constraint duals
-            are recovered. When specified, R_primal / R_dual contain
-            only the rows for the requested variables, and
-            primal_vars / dual_vars are filtered to match.
-        """
-        # 1. Compile / use cache to get param_prog, inverse_data
-        # 2. Call solver.get_canonical_maps(param_prog) for full maps
-        # 3. If variables is not None, row-slice R_primal / R_dual
-        #    using VarInfo/DualInfo offsets
-        ...
+Any linear packing introduced by attribute lowering is composed into the maps.
+For example, a symmetric parameter may have a reduced internal representation,
+but callers should not have to discover that representation through private
+attributes. Values must satisfy the original parameter attributes; the API does
+not define an extension to invalid parameter values. A compact representation
+for sparse or symmetric parameters is a possible additional interface, discussed
+below.
+
+Compilation must preserve affine dependence on these coordinates. Paths that
+evaluate nonlinear parameter expressions before compilation cannot advertise
+the result as an affine map from the original parameters. In particular, DGP's
+parameter logs and primal exponentials require a separate transformation
+contract; the initial implementation should reject `gp=True` rather than hide
+those operations in `M` or `R`.
+
+## Forward maps and solver layout
+
+Every map has shape `(number_of_output_values, total_param_size)`. Vector inputs
+produce dense flat vectors. Matrix inputs produce the data array in the exact
+order declared by `MatrixStructure`; the sparse format of `M` itself is
+independent of the output matrix's format.
+
+The sparsity structure is fixed across valid parameter values. A coefficient
+that evaluates to zero remains in its structural slot. Compilation must not
+infer sparsity from one numerical parameter assignment or drop slots needed by
+later assignments. Duplicate contributions must be combined into the declared
+storage layout.
+
+Keys use solver-native names, with `d` reserved for the compiled objective's
+constant offset:
+
+| Solver | Target form | Map keys |
+| --- | --- | --- |
+| SCS | Minimize `0.5 x'Px + c'x`, with `Ax + s = b`, `s in K` | `P` when used, `c`, `d`, `A`, `b` |
+| Clarabel | Minimize `0.5 x'Px + q'x`, with `Ax + s = b`, `s in K` | `P` when used, `q`, `d`, `A`, `b` |
+| ECOS | Minimize `c'x`, with `Ax = b`, `Gx + s = h`, `s in K` | `c`, `d`, `A`, `b`, `G`, `h` |
+| OSQP | Minimize `0.5 x'Px + q'x`, with `l <= Ax <= u` | `P`, `q`, `d`, `A`, `l`, `u` |
+
+These are numerical solver inputs, not necessarily the intermediate dictionary
+returned by `get_problem_data()`. OSQP, for example, currently stacks equality
+and inequality blocks inside `solve_via_data()`. `d` is bookkeeping for objective
+recovery and is not passed to the solver. Recovering the original objective
+also requires accounting for any maximization-to-minimization sign change.
+
+### Conic interfaces
+
+For the formatted program used by the base conic adapter,
+`apply_parameters()` returns coefficients `A0, b0` with
+`A0 @ x + b0 in K`. Its solver inputs are `A = -A0`, `b = b0`.
+The maps must reproduce that adapter's result, including the already-applied
+cone layout and the solver's quadratic storage convention. ECOS additionally
+splits equality and conic-inequality rows.
+
+This is a specification of the result, not a requirement to extract rows from
+`reduced_A` in every backend. CVXPY's `ParamProb` abstraction also allows
+representations other than the traditional stuffed sparse tensors.
+
+### OSQP
+
+For the unformatted program consumed by `QpSolver`, write the constraint
+coefficients as `AF` and the constant vector as `bg`. With equality rows first:
+
+```text
+A_eq =  AF[:n_eq]       b_eq = -bg[:n_eq]
+F    = -AF[n_eq:]       g    =  bg[n_eq:]
+
+A = [A_eq; F]
+l = [b_eq; -inf]
+u = [b_eq; g]
 ```
 
-This method is the right level for variable subsetting because:
-
-- It has access to the compilation cache (`_cache.param_prog`,
-  `_cache.solving_chain`), avoiding redundant compilation.
-- It can map user-level `Variable` objects to canonical variable IDs
-  via the `inverse_data` chain (the reduction chain may rename or
-  split variables).
-- The solver's `get_canonical_maps()` stays simple — it always builds
-  full recovery matrices over canonical variables, with no knowledge
-  of which user variables matter.
-
-One large sparse matmul is significantly faster than many small ones,
-especially on GPU where kernel launch overhead dominates. The
-`variables` parameter lets callers (e.g., MPC problems that only need
-$u_0$ out of thousands of state variables) avoid recovering unneeded
-variables while preserving the single-matmul pattern.
-
-### `ConicSolver.get_canonical_maps()` — Internal API
-
-The solver-level method that builds the maps from `ParamConeProg`.
-Each solver subclass inherits the base implementation or overrides
-for solver-specific behavior (equality/inequality splitting, PSD
-storage format, output matrix format):
-
-```python
-# In conic_solver.py
-class ConicSolver(Solver):
-    def get_canonical_maps(self, param_prog: ParamConeProg) -> CanonicalMaps:
-        """Return the complete set of sparse matrices.
-
-        Forward maps: compiles param_prog's monolithic tensors into
-        per-solver-parameter affine maps with solver-specific sign
-        conventions applied. Output matrix structures (P, A) use the
-        solver's preferred sparse format (CSC or CSR).
-
-        Recovery maps: builds sparse matrices that map the solver's
-        flat primal/dual vectors to per-variable/per-constraint values,
-        with svec unpacking and scaling baked in.
-
-        Returns NotImplemented for solvers that have not yet
-        implemented this API.
-        """
-        return NotImplemented
-```
-
-Map dictionary keys use whatever name the solver uses for each
-canonical parameter (SCS/ECOS use `c`; Clarabel/OSQP use `q`),
-matching CVXPYgen's existing `canon_p_ids`.
-
-`get_canonical_maps()` requires that `format_constraints()` has
-already been called on the `ParamConeProg`. Since this happens inside
-`_prepare_data_and_inv_data()`, the formatted state is always
-available after `get_problem_data()`. Alternatively,
-`get_canonical_maps()` could call `format_constraints()` itself if
-needed — it is idempotent.
-
-For solvers that support variable bounds (e.g., HiGHS), parametric
-bounds (`lb_tensor`, `ub_tensor`) are included as additional map
-entries (e.g., `"lb"` and `"ub"` keys).
-
-### How Recovery Matrices Are Built
-
-**R_primal** (shape: `sum(var_output_sizes) x n_solver_vars`):
-
-For each variable `v` with `col = var_id_to_col[v.id]`:
-
-- **Non-symmetric**: Identity block selecting `x[col:col+v.size]`.
-  Rows `[offset:offset+v.size]`, columns `[col:col+v.size]`,
-  all entries = 1.
-
-- **Symmetric** (n x n): The svec-to-full expansion matrix.
-  Input: `n*(n+1)/2` entries from the solver's x vector.
-  Output: `n*n` entries (full symmetric matrix in Fortran order).
-  Entries: 1 on diagonal, two entries per off-diagonal (both = 1,
-  writing to both `(i,j)` and `(j,i)`).
-
-**R_dual** (shape: `sum(dual_output_sizes) x m_solver_dual`):
-
-`R_dual` walks `param_prog.constraints` in canonical cone order,
-building a block for each constraint:
-
-- **Non-PSD**: Identity block selecting
-  `y[dual_offset:dual_offset+c.size]`. All entries = 1.
-
-- **PSD** (n x n): The svec unpacking matrix.
-  Input: `n*(n+1)/2` svec entries from the solver's dual vector.
-  Output: `n*n` entries (full symmetric matrix in Fortran order).
-  Entries: 1 on diagonal positions, $1/\sqrt{2}$ on off-diagonal
-  positions (two entries per off-diagonal svec element, writing to
-  both `(i,j)` and `(j,i)`).
-
-  For SCS (lower-triangular svec): columns ordered by lower-tri.
-  For Clarabel (upper-triangular svec): columns ordered by upper-tri.
-  The *output* is identical; only the column ordering differs.
-
-- **Multi-dual constraints** (SOC, ExpCone): Each dual variable gets
-  its own `DualInfo` entry pointing to its slice of the output.
-
-This replaces CVXPYgen's fragile `get_dual_variable_info()` (which
-traces `cons_id_map` through hardcoded `inverse_data[-1..-4]` indices)
-and CVXPYlayers' per-cone-type unpacking logic.
-
-### Forward Maps: Base Implementation (SCS, Clarabel)
-
-1. **P map**: `reduced_P.reduced_mat` (unchanged)
-2. **q/c map**: `param_prob.q[:-1, :]` (all rows except last)
-3. **d map**: `param_prog.q[[-1], :]` (last row only)
-4. **A map**: Rows of `reduced_A.reduced_mat` corresponding to matrix
-   columns, with sign = **-1** applied.
-5. **b map**: Rows of `reduced_A.reduced_mat` corresponding to the
-   last column, scattered to dense shape `(m, total_param_size + 1)`.
-6. **Structures**: `reduced_P.problem_data_index` for P;
-   constraint indices/indptr (excluding last column) for A.
-
-### Forward Maps: OSQP Override
-
-1. **P map**: Same as base.
-2. **q map**: `param_prog.q[:-1, :]`
-3. **d map**: `param_prog.q[[-1], :]`
-4. **A map**: Matrix rows from `reduced_A`, with selective sign flip
-   (negate inequality rows only).
-5. **l map**: Equality vector rows, negated. Inequality rows have
-   offset `v = -inf` (no lower bound).
-6. **u map**: All vector rows, with per-row sign vector.
-
-### Forward Maps: ECOS Override
-
-Splits constraints into equality (A, b) and inequality (G, h) groups.
-
-### Constant Offset Representation
-
-Each forward map is an `(M, v)` pair: `M @ param_vec + v`.
-
-The `ParamConeProg` internally uses a trailing-`1.0` convention where
-a single matrix's last column encodes constants.
-`get_canonical_maps()` splits this into `(M, v)` at construction time.
-This split is necessary because consolidating all solver parameters
-(including bounds) into affine maps would introduce `inf` values into
-the matrix. Today, `inf` values never appear in any matrix — OSQP's
-`-inf` lower bounds are hardcoded at solve time in `osqp_qpif.py`,
-not stored in `ParamConeProg`. Naively putting them in the last column
-of a combined map matrix would cause two problems:
-
-1. **Differentiability.** The backward pass through
-   `[M | v] @ [p; 1]` computes `[M | v].T @ d_output`. Any
-   `d_output` entry that is zero for an `inf` row produces
-   `inf * 0.0 = NaN`, poisoning gradients.
-
-2. **Embedded efficiency.** CVXPYgen would recompute always-`inf`
-   entries on every re-solve and would need to represent `inf` in
-   generated C code.
-
-With the `(M, v)` split, `M` contains only finite entries and `v`
-(which may contain `inf`) is a constant with zero gradient — it never
-participates in differentiation. The split costs zero extra flops.
-CVXPYgen can trivially identify `inf` entries in `v` and construct
-reduced maps if it wants to skip those rows in generated code.
-
-**Alternative considered: exclude purely constant rows from `M`.**
-This is a special case of the `(M, v)` split that additionally changes
-the shape of `M`. Rejected because it complicates the API (the caller
-must recombine rows) without meaningful efficiency gains.
-
-## How This Simplifies Downstream Libraries
-
-### CVXPYgen
-
-CVXPYgen's `solvers.py` (~800 lines of `get_affine_map()` logic across
-5 solver classes) and `get_dual_variable_info()` (~60 lines of fragile
-`inverse_data` chain tracing) would be replaced by a single call:
-
-```python
-# Before (cvxpygen/cpg.py + cvxpygen/solvers.py)
-solver_interface = SCSInterface(data, param_prob, ...)
-for p_id in solver_interface.canon_p_ids:
-    affine_map = solver_interface.get_affine_map(p_id, param_prob, ...)
-    # ... process ...
-dual_info = get_dual_variable_info(problem, inverse_data, ...)
-
-# After
-canon = problem.get_canonical_maps(solver)
-# Forward maps -- generate C code for each affine map:
-for p_id, (M, v) in canon.maps.items():
-    codegen_sparse_matmul(p_id, M, v)
-# Primal recovery -- generate C code for R_primal @ x:
-codegen_sparse_matmul("primal_recovery", canon.R_primal)
-# Dual recovery -- generate C code for R_dual @ y:
-codegen_sparse_matmul("dual_recovery", canon.R_dual)
-```
-
-The entire `SolverInterface` class hierarchy and the fragile
-`inverse_data[-4]` indexing in CVXPYgen would be deleted. CVXPYgen
-keeps its sparsity optimization, adjacency tracking, and C codegen.
-
-### CVXPYlayers
-
-CVXPYlayers' recovery logic (~100 lines of per-cone-type dispatch
-and per-framework svec unpacking) becomes one sparse matmul per
-direction (`R_primal @ solver_x`, `R_dual @ solver_y`). The R
-matrices are scipy sparse at setup time, converted once to the
-framework's sparse format. Forward maps similarly replace the
-per-solver `torch_to_data()` reconstruction with sparse matmuls.
-
-
-### CVXPY's Own Solvers
-
-The existing `apply_parameters()` + solver `apply()` path is
-unchanged. The new API is additive.
-
-## What Stays in CVXPYgen
-
-Even with this API, CVXPYgen would retain:
-
-- **Adjacency tracking**: `user_p_name_to_canon_outdated` for
-  selective updates.
-- **C code generation**: The actual codegen for evaluating affine maps,
-  reconstructing sparse matrices, and calling solver C APIs.
-- **Gradient support**: The two-stage canonicalization for non-OSQP
-  gradient computation.
-- **Explicit solver**: The MPQP piecewise-affine solution map.
-
-## What Stays in CVXPYlayers
-
-CVXPYlayers would retain:
-
-- **Framework-specific tensor operations**: Converting scipy sparse
-  maps to torch CSR / JAX BCSR / MLX arrays; scipy-backed CPU matmul
-  (`_ScipySparseMatmul`).
-- **Batching logic**: Broadcasting unbatched parameters, batch
-  dimension handling.
-- **GP support**: Log-space transformations via `Dgp2Dcp`.
-- **Solver-specific solve/derivative calls**: The actual solver
-  invocation, backward pass, warm-start, `solve_only_batch()`.
-- **Recovery matrix conversion**: Converting `R_primal` / `R_dual`
-  scipy sparse matrices to framework-specific sparse tensors
-  (torch CSR, JAX BCSR, MLX).
-- **Parametric quad_form**: The `quad_form_dpp_scope()` monkey-patch
-  for parametric `quad_form(x, P)` with PSD parameters.
-
-## Migration Path
-
-### Phase 1: Add the API to CVXPY
-
-Add `get_canonical_maps()` to the solver interface classes and
-`Problem`. The base conic solver implementation handles SCS/Clarabel.
-OSQP and ECOS get overrides. Unit tests verify that the maps produce
-the same values as the existing `apply_parameters()` + solver
-`apply()` path.
-
-### Phase 2: Adopt in CVXPYlayers
-
-Replace `parse_args.py`'s direct access to `reduced_P`, `q`,
-`reduced_A` with a call to `problem.get_canonical_maps()`. Simplify
-all solver interfaces to consume the compiled maps. The
-`problem_data_index` plumbing goes away.
-
-### Phase 3: Adopt in CVXPYgen
-
-Replace `cvxpygen/solvers.py`'s `SolverInterface` hierarchy with
-calls to `problem.get_canonical_maps()`. CVXPYgen's `get_affine_map()`
-logic is deleted. The `process_canonical_parameters()` function
-simplifies to iterating over `canon.maps.items()`.
-
-### Phase 4: Deprecate internal access
-
-Once both libraries are migrated, the direct access patterns
-(`param_prob.reduced_A.reduced_mat`, `param_prob.q`, etc.) can be
-considered internal and documented as such.
-
-## Alternatives Considered
-
-### Alternative 1: Upstream CVXPYgen's SolverInterface into CVXPY
-
-Instead of a new API on CVXPY's existing solver classes, we could move
-CVXPYgen's `SolverInterface` class hierarchy into CVXPY wholesale.
-
-**Rejected because**: CVXPYgen's solver interfaces are tightly coupled
-to code generation concerns (C type names, augmentation with -inf,
-constraint info for code layout). The map-construction logic is what
-we want; the codegen scaffolding should stay in CVXPYgen.
-
-### Alternative 2: Have CVXPYlayers use CVXPYgen's decomposition
-
-CVXPYlayers could depend on CVXPYgen and call its `get_affine_map()`.
-
-**Rejected because**: This creates an unnecessary dependency and
-doesn't fix the underlying problem (the map-construction logic belongs
-in CVXPY, not in a downstream library).
-
-### Alternative 3: Only expose a split `apply_parameters()`
-
-Instead of returning affine maps, return the concrete values split
-per solver parameter from a single `apply_parameters()` call (i.e.,
-return `P_values, q, d, A_values, b` instead of `c, d, A, b`).
-
-**Rejected because**: This doesn't help CVXPYgen (which needs the maps,
-not the values) and doesn't fully help CVXPYlayers (which needs the
-maps to do the matmul in its own tensor framework).
-
-## Open Questions
-
-1. **Should `get_canonical_maps()` be cached?** Yes, if CVXPY
-   migrates its own solve path to use canonical maps (see Future Work).
-   Caching the result lets CVXPY check whether the solver returned
-   `NotImplemented` or a real `CanonicalMaps` and use that to decide
-   whether to take the new maps path or fall back to the old `apply()`
-   path — without recomputing the maps on every solve. For the
-   initial external-only use case (CVXPYgen, CVXPYlayers), caching is
-   not strictly necessary since those libraries query once.
-
-2. **Relationship with `apply_param_jac()`**: CVXPY's `backward()`
-   uses `apply_param_jac()`, which computes `M.T @ dvalues` — the
-   transpose of the same parameter mapping that `get_canonical_maps()`
-   exposes as `M`. Either `apply_param_jac()` should be simplified to
-   use the maps from `get_canonical_maps()` internally, or both should
-   share a common interface for constructing the per-solver-parameter
-   affine maps so the logic isn't duplicated.
-
-3. **Naming**: `get_canonical_maps()` vs `get_compiled_maps()`
-   vs `compile_param_maps()` vs something else?
-
-4. **PSD dual storage convention**: The `R_dual` matrix bakes in the
-   solver's PSD storage convention (SCS lower-triangular, Clarabel
-   upper-triangular). The output is always a full symmetric matrix
-   regardless. Should we also expose the intermediate svec format
-   for libraries that want it? (Likely no -- the full matrix is the
-   user-facing format and the overhead is minimal.)
-
-5. **CVXPYgen dual recovery migration**: CVXPYgen currently traces
-   `inverse_data[-1..-4]` for dual recovery and also uses
-   `inverse_data` for primal variable recovery. `R_primal` and
-   `R_dual` (plus `VarInfo` / `DualInfo` metadata) should cover both
-   cases, replacing the fragile index-based `inverse_data` tracing
-   entirely. (Confirmed with Max Schaller.)
-
-6. **Multi-dual constraints**: SOC has 2 dual variables, ExpCone has 3.
-   The `R_dual` / `DualInfo` design handles this by having one
-   `DualInfo` entry per dual variable (not per constraint). CVXPYgen
-   exposes one dual per constraint (a single vector for SOC, not
-   separate t and x duals), while CVXPYlayers uses per-dual-variable
-   entries. These conventions differ — we should pick one and make the
-   shared API consistent.
-
-## Future Work
-
-CVXPY's own solver `apply()` path currently duplicates much of the
-same sign-correction and splitting logic that `get_canonical_maps()`
-would formalize. In the long term, CVXPY could migrate its internal
-`apply_parameters()` + solver `apply()` path to use the same
-`CanonicalMaps` infrastructure. Since the base `get_canonical_maps()`
-returns `NotImplemented`, CVXPY can incrementally adopt this: for
-solvers that return a real `CanonicalMaps`, use the maps path
-(evaluate the affine maps to produce solver inputs); for solvers
-that return `NotImplemented`, fall back to the existing `apply()`
-path. This lets solvers migrate one at a time without breaking
-anything, and eventually makes the canonical maps the single source
-of truth for parameter-to-solver-input conversion across CVXPY,
-CVXPYgen, and CVXPYlayers.
+The infinite lower-bound entries have zero map rows and constant offsets of
+`-inf`. Apply triangular extraction and storage ordering to `P` as required by
+the solver's setup/update interface; copying an internal full `P` map unchanged
+is not a sufficient contract.
+
+### Constants and bounds
+
+Each map is an `(M, v)` pair. `M` contains finite coefficients; `v` may contain
+infinite entries for absent bounds. Constant infinite entries have zero rows
+in `M`, so their parameter derivative is zero. Infinite constants must be
+extracted without introducing `inf` or `NaN` into the linear map.
+
+Keeping `v` separate prevents a transpose multiply from encountering
+`inf * 0` through a homogeneous constant column. For a forward-map cotangent
+`g`, the parameter contribution is `M.T @ g`; the constant offset is excluded.
+Code generators may initialize constant entries once and update only entries
+that depend on parameters.
+
+Native variable bounds, including `lb_tensor` and `ub_tensor` when applicable,
+must be included if the target adapter passes them to the solver. If an adapter
+instead lowers bounds into constraints, they are represented in those constraint
+maps. Bounds must not be silently omitted or duplicated.
+
+## Recovery must compose through the chain
+
+The solver adapter knows its output layout. It does not, by itself, know how
+to reconstruct the original problem's variables. `Problem` must compose the
+adapter's recovery with the applicable reductions, including variable attribute
+lowering, constraint ID mappings, and cone conversions.
+
+Build these maps structurally from reduction metadata and local recovery
+operators. Do not probe `invert()` on basis vectors: that would be expensive,
+would execute status-dependent code, and would not establish linearity.
+
+Typical local operators include:
+
+| Operation | Sparse recovery block |
+| --- | --- |
+| Variable or dual slicing | Row selection |
+| Symmetric primal expansion | Duplicate unscaled triangular entries into both matrix positions |
+| Diagonal or sparse variable expansion | Scatter into the original shape |
+| PSD dual unpacking | Expand the solver's triangle, with `1/sqrt(2)` off-diagonal scaling for scaled svec conventions |
+| Batched SOC or exponential-cone duals | Undo argument interleaving and select each dual-variable block |
+
+Symmetric primal packing and scaled PSD dual svec are different conventions.
+For SCS, scaled PSD dual entries follow lower-triangular column order; Clarabel
+uses upper-triangular column order. Recovery must compose the convention chosen
+by the actual chain and return the same full matrix representation to callers.
+
+Use one `DualInfo` per object in `constraint.dual_variables`, identified by both
+dual-variable ID and parent constraint ID. This resolves the earlier ambiguity
+between a whole constraint dual and an individual dual variable. CVXPYgen can
+group these entries by constraint; CVXPYlayers can select individual entries.
+
+The initial split into `R_primal @ solver_x` and `R_dual @ solver_y` is supported
+only when the selected chain admits that separation. A dualizing reduction may
+exchange primal and dual roles; other reductions may not admit these recovery
+maps at all. Such chains need either a more general block recovery operator or
+an explicit unsupported error. Infeasibility certificates, missing solver
+outputs, status handling, projection of numerical solutions onto attributes,
+and nonlinear inverse transformations are outside this linear recovery contract.
+
+## Implementation and adoption
+
+1. **Add internal map-building hooks.** Solver adapters provide forward maps,
+   solver output layouts, and local recovery operators. Relevant reductions
+   expose composable recovery information. An unsupported internal hook may
+   return `NotImplemented`; the public API raises a descriptive error.
+2. **Add `Problem.get_canonical_maps()`.** Reuse the compilation chain, compose
+   parameter coordinates and recovery, and select requested outputs. Construct
+   selected recovery rows directly where practical. Returned arrays must not
+   alias mutable cached tensors that a downstream library can reorder.
+3. **Start with SCS and Clarabel, then OSQP and ECOS.** Support each solver only
+   for the chains and cone families whose forward and recovery contracts are
+   covered. Keep CVXPY's existing solve path while establishing equivalence.
+4. **Migrate downstream extraction.** CVXPYgen replaces affine-map and recovery
+   extraction in its canonicalizer and adapter mixins. It retains solver code
+   generation, settings, update adjacency, and derivative machinery.
+   CVXPYlayers replaces internal tensor/layout and recovery bookkeeping while
+   retaining framework conversion, batching, warm starts, and solver derivatives.
+5. **Share CVXPY's own implementation when practical.** Reusing map construction
+   in the numerical solve path and `apply_param_jac()` can reduce duplication.
+   Adoption should be incremental and measured; neither deleting all downstream
+   solver interfaces nor changing CVXPY's solve path is required for this API.
+
+Cache entries must be tied to the actual compilation: problem structure,
+parameter coordinate layout, solver, backend, and compilation options that
+affect the chain. Parameter value changes reuse the maps. Output selections can
+reuse compilation without requiring a fully materialized recovery map.
+
+### Acceptance criteria
+
+- Compare evaluated maps with existing numerical adapter inputs across multiple
+  parameter assignments, including zero crossings, constants, sparse parameters,
+  and dimension-reducing attributes. Check matrix layout as well as values.
+- Compare recovery with supported reduction-chain inversion for scalar, vector,
+  matrix, symmetric, sparse, and batched cone outputs. Include both PSD storage
+  conventions, multi-dual constraints, selection ordering, and empty selections.
+  Compare the structural recovery before any numerical attribute projection.
+- Check adjoint identities for forward and recovery maps. When comparing against
+  `apply_param_jac()`, account for its internal coordinates, sign conventions,
+  and supported objective terms; it is not automatically the transpose of every
+  solver-native map.
+- Check infinite bound offsets, fixed structural zeros, cache reuse, and explicit
+  errors for unsupported chains or requested outputs.
+
+These checks establish map correctness. The solver's implicit derivative remains
+a separate operation: `M.T` and `R.T` alone do not differentiate the optimization
+problem.
+
+## Decisions still needed
+
+1. **Parameter storage:** Is the default full original-parameter coordinate
+   system sufficient, or should the first version also expose a compact packing
+   operator for sparse and symmetric parameters? Either choice needs an explicit
+   packing and adjoint contract; internal reduced IDs should not become public.
+2. **Recovery generality:** Should the first version support a single operator
+   on `[solver_x; solver_y]`, or reject chains that require cross-recovery and
+   add block operators later? How should unavailable dual recovery be requested
+   separately from otherwise supported forward maps?
+3. **Coverage:** Which cone families, direct-cone paths, and compilation backends
+   ship initially? DGP, complex realification, and other transformations need
+   explicit contracts before expanding beyond the initial real DPP scope.
+4. **Surface and metadata:** Finalize method names, compilation keyword arguments,
+   solver/cone metadata types, and how the contract is versioned before making
+   it public.
+
+The earlier alternatives still do not address the shared need: returning only
+evaluated data cannot support framework-native evaluation or code generation;
+moving all of CVXPYgen's solver adapters into CVXPY also moves code-generation
+policy; making CVXPYlayers depend on CVXPYgen leaves ownership of CVXPY's
+compilation conventions downstream.
+
+## Source snapshots
+
+Reviewed against upstream sources on October 23, 2026:
+
+- **CVXPY** ([`8280648`](https://github.com/cvxpy/cvxpy/tree/8280648bd1f70fce701d362de4f58120f940c2f3)):
+  [cone formatting](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cone_format.py),
+  [conic adapter](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/conic_solvers/conic_solver.py),
+  [QP adapter](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/qp_solvers/qp_solver.py),
+  [OSQP inputs](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/solvers/qp_solvers/osqp_qpif.py),
+  [parametric cone program](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/dcp2cone/cone_matrix_stuffing.py),
+  [attribute lowering](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cvx_attr2constr.py).
+- **CVXPYgen** ([`79c0255`](https://github.com/cvxgrp/cvxpygen/tree/79c0255236b78d271285c3689a9ff0cd8079ae30)):
+  [canonicalizer](https://github.com/cvxgrp/cvxpygen/blob/79c0255236b78d271285c3689a9ff0cd8079ae30/cvxpygen/canonicalizer.py),
+  [shared adapter extraction](https://github.com/cvxgrp/cvxpygen/blob/79c0255236b78d271285c3689a9ff0cd8079ae30/cvxpygen/solvers/_interface.py).
+- **CVXPYlayers** ([`bd9caf9`](https://github.com/cvxpy/cvxpylayers/tree/bd9caf9826d758722a5c42b8a51775fcbc037ffe)):
+  [solver context construction](https://github.com/cvxpy/cvxpylayers/blob/bd9caf9826d758722a5c42b8a51775fcbc037ffe/src/cvxpylayers/interfaces/__init__.py),
+  [parameter and recovery metadata](https://github.com/cvxpy/cvxpylayers/blob/bd9caf9826d758722a5c42b8a51775fcbc037ffe/src/cvxpylayers/utils/parse_args.py),
+  [Moreau interface](https://github.com/cvxpy/cvxpylayers/blob/bd9caf9826d758722a5c42b8a51775fcbc037ffe/src/cvxpylayers/interfaces/moreau_if.py).
