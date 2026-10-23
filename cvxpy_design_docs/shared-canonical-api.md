@@ -23,59 +23,79 @@ primal_flat = canon.R_primal @ solver_x
 dual_flat = canon.R_dual @ solver_y
 ```
 
-## Map construction
+## Parameter coordinates and maps
 
-The proposal adds affine-map export to the compiled `ParamProb` representation.
-Each reduction exposes sparse operators for the parameter packing and solution
-recovery it performs. `SolvingChain` composes those operators and the exported
-maps. The reductions' `invert()` methods use the same recovery operators,
-including those that combine duals from multiple auxiliary constraints.
+The compiled `ParamProb` defines the columns of every forward map. Its
+`param_id_to_col`, `param_id_to_size`, and `parameters` refer to **compiled
+parameter IDs**. For a compiled parameter `r`, callers place its Fortran-flattened
+value in `p[col:col + r.size]`, where `col = param_id_to_col[r.id]`.
+The exporter splits the internal constant column into `v`:
 
-Each solver interface specifies its final signs, row splits/stacks, triangular
-extraction, CSC/CSR ordering, and native output blocks. Shared layout utilities
-apply these operations to both the values maps and sparse structures.
-`Problem.get_canonical_maps()` compiles the problem or reuses its cached
-compilation, then packages the chain's result as `CanonicalMaps`.
+```text
+solver_input_values = M @ p + v
+```
 
-## Contract
+`Chain.compose_param_id_map()` supplies the separate correspondence
+`original_id -> [compiled_id, ...]`; an omitted ID is unchanged. A reduction can
+change a parameter's ID and shape, or split it into several parameters.
+`CanonicalMaps.parameter_id_map` exposes this existing correspondence.
+It does not assign vector offsets or transform values.
 
-- **Affine maps:** The program exporter produces `(M, v)` pairs with finite
-  coefficients in `M`. The layout utilities insert constant infinite bounds
-  into `v` and zero rows into `M`. Callers evaluate `maps[name]` as `M @ p + v`.
-- **Parameter storage:** `SolvingChain` records each original parameter's ID,
-  logical shape, packed size, offset, and entry order in `parameter_layouts`.
-  Callers assemble `p` by concatenating these compact blocks without a constant
-  sentinel. Sparse blocks contain stored entries; symmetric blocks use the
-  compiled triangular packing; dense blocks use Fortran order. The reductions'
-  packing operators and their adjoints work on stored entries without densification.
-- **Matrix storage:** The program exporter preserves structural slots across
-  parameter values, including evaluated zeros. The layout utilities produce
-  `MatrixStructure` entries with the solver's CSC/CSR ordering and triangle.
-  The solver interface identifies native bound inputs and fixed cone data;
-  `SolvingChain` includes their maps and metadata in the result.
-- **Recovery:** `SolvingChain` constructs the requested recovery rows and records
-  original IDs, shapes, and offsets in `primal_vars` and `dual_vars`. It creates
-  one dual entry per `constraint.dual_variables` object, with its parent constraint
-  ID. The solver interface defines the native output blocks that callers
-  concatenate into `solver_x` and `solver_y`. Callers reshape recovered slices
-  in Fortran order.
-- **Selection:** `Problem.get_canonical_maps()` passes the requested outputs to
-  `SolvingChain`: `None` requests all original primal variables and explicit
-  constraint duals, a list requests those outputs in caller order within each
-  recovery vector, and an empty list requests forward maps only.
-  `Problem.get_canonical_maps()` raises an error if the chain cannot recover a
-  requested output.
+For example, `CvxAttr2Constr` replaces a sparse parameter with a reduced parameter
+whose size is its number of stored entries. The exported maps use that reduced
+parameter's ID and size. Callers never construct a dense vector of the original
+parameter's logical entries.
+
+The reductions already implement `update_parameters()`, `param_forward()`, and
+`param_backward()`. These hooks define value updates, parameter tangents, and
+user-visible parameter gradients. The proposal adds framework-independent exports
+of these transformations. `M.T` produces compiled-coordinate cotangents; the
+reductions' `param_backward()` transformations convert them to original-parameter
+gradients. The exports preserve the existing symmetric-parameter gradient
+conventions.
+
+## Construction and returned data
+
+The compiled program exports `(M, v)` pairs, matrix structures, and native bound
+maps. Each solver interface supplies its remaining signs, row splits/stacks,
+triangular extraction, CSC/CSR ordering, and native output blocks. Shared layout
+utilities apply each operation to the values map and matrix structure together.
+The exporter and layout utilities preserve structural slots across parameter
+values. Constant infinite bounds belong in `v`, with zero corresponding rows in
+`M`.
+
+The reductions export sparse recovery operators from the transformations used by
+`var_forward()`, `var_backward()`, and `invert()`. `SolvingChain` composes these
+operators with the solver interface's native output layout to produce `R_primal`
+and `R_dual`. The chain uses `compose_var_id_map()` and `compose_constr_id_map()`
+for ID tracing; the numerical operators supply expansion, scaling, and recovery
+from auxiliary constraints.
+
+`Problem.get_canonical_maps()` compiles or reuses its cached compilation. It asks
+`SolvingChain` for the requested recovery rows and packages the maps and metadata.
+`variables=None` requests original primal variables and explicit constraint duals;
+a list requests those outputs in caller order within each recovery vector; an
+empty list requests forward maps only. The method raises an error when the chain
+cannot recover a requested output.
+
+`primal_vars` and `dual_vars` identify original outputs by ID, shape, and offset.
+Each dual entry identifies an object in `constraint.dual_variables` and its parent
+constraint. The solver interface records how native output blocks form `solver_x`
+and `solver_y`; callers reshape recovered slices in Fortran order.
 
 ## Decisions for review
 
-1. **Recovery interface:** Should `SolvingChain` return separate primal and dual
+1. **Parameter transformations:** How should reductions export the existing
+   update/tangent/gradient transformations for CVXPYlayers and CVXPYgen? Linear
+   transformations admit sparse operators; DGP's logs and exponentials require
+   a nonlinear representation. The ID correspondence and compiled-vector layout
+   already exist.
+2. **Recovery interface:** Should `SolvingChain` return separate primal and dual
    maps, or one block operator on `[solver_x; solver_y]` for reductions that
    exchange primal and dual roles?
-2. **Coverage:** Can the first implementation target SCS/Clarabel and the
+3. **Coverage:** Can the first implementation target SCS/Clarabel and the
    stuffed-tensor representation, or must it also export OSQP/ECOS inputs,
-   direct-cone recovery, and other `ParamProb` representations? Should
-   `Dgp2Dcp` expose its logs and exponentials as separate parameter/recovery
-   transformations in that implementation?
+   direct-cone recovery, and other `ParamProb` representations?
 
 ## Appendix: contract sketch
 
@@ -107,16 +127,6 @@ class DualInfo:
 
 
 @dataclass
-class ParameterInfo:
-    param_id: int
-    shape: tuple[int, ...]  # Logical shape, not packed storage size.
-    offset: int
-    size: int              # Number of packed entries.
-    # Ordered logical indices for compact storage; None for dense F-order.
-    indices: tuple[np.ndarray, ...] | None
-
-
-@dataclass
 class CanonicalMaps:
     maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
     structures: dict[str, MatrixStructure]
@@ -124,18 +134,18 @@ class CanonicalMaps:
     R_dual: scipy.sparse.csr_array
     primal_vars: list[VarInfo]
     dual_vars: list[DualInfo]
-    parameters: list[Parameter]
-    parameter_layouts: list[ParameterInfo]
+    parameters: list[Parameter]  # Compiled parameters.
+    parameter_id_map: dict[int, list[int]]  # Original -> compiled IDs.
     param_id_to_col: dict[int, int]
     param_id_to_size: dict[int, int]
     total_param_size: int
     solver_metadata: dict[str, object]
 ```
 
-`SolvingChain` sets `param_id_to_size` and `total_param_size` from packed block
-sizes and records the packing operators' gather order in `ParameterInfo.indices`.
-The packing adjoints scatter cotangents into those coordinates without duplicating
-symmetric off-diagonal cotangents.
+The program exporter copies `param_id_to_col`, `param_id_to_size`, and
+`total_param_size` from the compiled program, excluding the constant sentinel.
+`SolvingChain` obtains `parameter_id_map` from `compose_param_id_map()`.
+The parameter-transformation export is the first review decision above.
 
 The solver interface supplies cone order, fixed cone parameters, vector lengths,
 and native output block order for `solver_metadata`. The program exporter supplies
@@ -146,5 +156,7 @@ maximization/minimization sign in `solver_metadata` for objective recovery.
 
 CVXPY snapshot `8280648`:
 [compiled program](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/dcp2cone/cone_matrix_stuffing.py),
-[chain composition](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/chain.py),
+[ID composition](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/chain.py),
+[parameter hooks](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/reduction.py),
+[attribute lowering](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cvx_attr2constr.py),
 [cone recovery](https://github.com/cvxpy/cvxpy/blob/8280648bd1f70fce701d362de4f58120f940c2f3/cvxpy/reductions/cone2cone/exact.py).
