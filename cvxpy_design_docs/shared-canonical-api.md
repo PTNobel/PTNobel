@@ -1,6 +1,6 @@
 ChatGPT generated:
 
-# Shared canonical parameter API
+# Canonical parameter API
 
 **Status:** Draft · **Updated:** October 23, 2026  
 **Original authors:** Claude Opus 4.6, with prompting from Parth Nobel  
@@ -195,13 +195,13 @@ to the selected solver interface. Each interface provides an internal
 `get_canonical_maps()` method that returns maps in its solver's input format,
 including the input names, signs, row grouping, and matrix storage.
 
-The interfaces use shared extraction code for the parameter-to-coefficient
-tensors in the compiled program. Interfaces with the same input format can
+The interfaces use CVXPY's coefficient extraction code to obtain maps from the
+parameter-to-coefficient tensors in the compiled program. Interfaces with the same input format can
 inherit a common implementation; an interface overrides it where its solver
 requires a different format.
 
-The shared reductions have already applied solver-aware PSD conversion and cone
-layout before conic map extraction. QP extraction follows `QpSolver.apply()`'s
+The reductions preceding the solver interface have already applied solver-aware
+PSD conversion and cone layout before conic map extraction. QP extraction follows `QpSolver.apply()`'s
 signs on its unformatted program. Each matrix-storage conversion transforms the
 values map and its indices together.
 
@@ -238,8 +238,8 @@ that sentinel or the interface's maps with the compilation:
 - When the interface returns maps, CVXPY evaluates them to produce solver inputs.
 - When the interface returns `NotImplemented`, CVXPY calls its existing `apply()`.
 
-Each converted interface shares its map construction between CVXPY's solve path
-and downstream callers.
+CVXPY's solve path, CVXPYgen, and CVXPYlayers use each converted interface's
+map construction.
 
 ### Migration plan
 
@@ -265,7 +265,7 @@ and downstream callers.
 ## Open questions
 
 - **`apply_param_jac()` integration:** Should it consume these maps, or should
-  both paths share their construction? `ParamConeProg.apply_param_jac()` returns
+  both paths use the same map constructors? `ParamConeProg.apply_param_jac()` returns
   derivatives in compiled-parameter coordinates and rejects quadratic objectives;
   `Problem.backward()` separately applies the reductions' `param_backward()`
   hooks.
@@ -273,7 +273,7 @@ and downstream callers.
   addition to the proposed full-matrix recovery?
 - **Dual grouping:** The sketch uses one entry per dual variable. CVXPYgen
   currently groups duals by constraint, whereas CVXPYlayers selects individual
-  dual variables. Should the shared API use per-dual-variable or per-constraint
+  dual variables. Should the API use per-dual-variable or per-constraint
   grouping?
 
 ## Appendix: API sketch
