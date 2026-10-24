@@ -28,9 +28,7 @@ recovery. Solver invocation and differentiation through the solve remain with
 the caller.
 
 The public method reuses `get_problem_data()` compilation and its reduction
-chain. `variables=None` includes all original variables and explicit constraint
-dual variables. A supplied list limits recovery and accompanying metadata to
-those objects.
+chain.
 
 ## What the API returns
 
@@ -83,7 +81,7 @@ In the problem below, the only parameter `p` needs no transformation, so
 p = cp.Parameter(2, value=np.array([1.0, -2.0]))
 x = cp.Variable(2)
 problem = cp.Problem(cp.Minimize(0.5 * cp.sum_squares(x) + p @ x), [x >= 0])
-canon = problem.get_canonical_maps(solver=cp.CLARABEL, variables=[x])
+canon = problem.get_canonical_maps(solver=cp.CLARABEL)
 
 param_vec = p.value.ravel(order="F")
 M, v = canon.maps["q"]
@@ -130,6 +128,21 @@ primal expansion with explicit zeros, and cone conversions combining auxiliary
 duals. Ordinary indexing stays as an index array. When a consumer needs a sparse
 matrix, it can represent indexing by one unit entry per output row; the
 exponentiation in `Exp` remains separate.
+
+The `variables` argument selects which original outputs receive recovery entries.
+Its elements are primal variable objects, such as `x`, or dual variable objects,
+such as `constraint.dual_variables[0]`:
+
+```python
+canon = problem.get_canonical_maps(
+    solver=cp.CLARABEL,
+    variables=[x, constraint.dual_variables[0]],
+)
+```
+
+With `variables=None`, the export includes all original primal variables and
+the dual variables of constraints in `problem.constraints`. A supplied list
+limits recovery entries and their metadata to the selected objects.
 
 ## Construction
 
