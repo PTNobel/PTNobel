@@ -41,6 +41,27 @@ chain.
 
 ## What the API returns
 
+`get_canonical_maps()` returns a `CanonicalMaps` object:
+
+```python
+@dataclass
+class CanonicalMaps:
+    maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
+    structures: dict[str, MatrixStructure]
+    primal_recovery: dict[int, np.ndarray | Exp | scipy.sparse.csr_array]
+    dual_recovery: dict[int, np.ndarray | scipy.sparse.csr_array]
+    primal_vars: list[VarInfo]
+    dual_vars: list[DualInfo]
+    cone_dims: ConeDims
+    constraints: list[Constraint]
+    parameters: list[Parameter]  # Compiled parameters.
+    param_transforms: list[ParameterTransform]  # In execution order.
+    param_id_map: dict[int, list[int]]  # Existing replacement correspondence.
+    param_id_to_col: dict[int, int]  # Excludes the constant sentinel.
+    param_id_to_size: dict[int, int]
+    total_param_size: int
+```
+
 ### Parameter preparation
 
 The solver-input maps consume `param_vec`, a vector of compiled parameter values.
@@ -269,24 +290,6 @@ class MatrixStructure:
     shape: tuple[int, int]
     indices: np.ndarray
     indptr: np.ndarray
-
-
-@dataclass
-class CanonicalMaps:
-    maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
-    structures: dict[str, MatrixStructure]
-    primal_recovery: dict[int, np.ndarray | Exp | scipy.sparse.csr_array]
-    dual_recovery: dict[int, np.ndarray | scipy.sparse.csr_array]
-    primal_vars: list[VarInfo]
-    dual_vars: list[DualInfo]
-    cone_dims: ConeDims
-    constraints: list[Constraint]
-    parameters: list[Parameter]  # Compiled parameters.
-    param_transforms: list[ParameterTransform]  # In execution order.
-    param_id_map: dict[int, list[int]]  # Existing replacement correspondence.
-    param_id_to_col: dict[int, int]  # Excludes the constant sentinel.
-    param_id_to_size: dict[int, int]
-    total_param_size: int
 
 
 @dataclass
