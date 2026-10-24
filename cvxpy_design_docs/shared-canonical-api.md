@@ -22,14 +22,18 @@ canon = problem.get_canonical_maps(
 M, v = canon.maps["q"]
 q = M @ param_vec + v
 primal_flat = canon.R_primal @ solver_x
+for info in canon.primal_vars:
+    if info.transform is PrimalTransform.EXP:
+        block = slice(info.offset, info.offset + info.size)
+        primal_flat[block] = np.exp(primal_flat[block])
 dual_flat = canon.R_dual @ solver_y
 ```
 
 The public method reuses `get_problem_data()` compilation and its reduction
 chain. `variables=None` includes all original variables and explicit constraint
 dual variables. A supplied list limits the recovery rows and accompanying
-metadata to those objects. GP parameter logs and primal exponentials remain
-separate from the affine maps.
+metadata to those objects. GP parameter logs use the parameter-transform tags;
+GP primal exponentiation uses the output tags described below.
 
 ## What the API returns
 
@@ -80,12 +84,19 @@ CVXPYgen traces `param_transforms` and unchanged compiled IDs back to original
 inputs, then combines those dependencies with the nonzero column blocks of
 each `M`. Constant offsets `v` contribute no dependencies.
 
-`R_primal` and `R_dual` map the solver's primal and dual vectors to concatenated
-original-variable values. `VarInfo` and `DualInfo` identify each output's ID,
-shape, and offset; callers reshape slices in Fortran order. The proposed
-`DualInfo` describes each object in `constraint.dual_variables`, also recording
-its parent constraint ID. Cone dimensions and constraint ordering accompany the
-maps so callers can construct solver inputs and identify the dual blocks.
+`R_primal` maps solver primal coordinates to concatenated output blocks.
+Each `VarInfo` identifies the original variable's ID, shape, offset, and an
+`Identity` or `Exp` tag. Callers apply the tag elementwise after the matrix
+multiplication, then reshape the block in Fortran order. Ordinary DCP outputs
+use `Identity`; GP outputs use `Exp` because the matrix recovers log-variable
+values. `Dgp2Dcp` supplies the `Exp` tags for the variables it transforms.
+
+`R_dual` recovers concatenated original constraint-dual values.
+`DualInfo` identifies each object in `constraint.dual_variables`, its parent
+constraint ID, shape, and offset; callers reshape slices in Fortran order.
+GP duals retain CVXPY's transformed-DCP convention and receive no exponentiation.
+Cone dimensions and constraint ordering accompany the maps so callers can
+construct solver inputs and identify dual blocks.
 
 ## Construction
 
@@ -145,7 +156,7 @@ and downstream callers.
    per-framework recovery bookkeeping. The returned maps incorporate the signs,
    vector extraction, and storage ordering its adapters currently perform.
    CVXPYlayers retains framework conversion, batching, solver/derivative calls,
-   and GP primal exponentiation. Parameter preprocessing uses the exported tags.
+   and evaluates primal output tags. Parameter preprocessing uses the exported tags.
 3. **CVXPYgen adopts the maps.** It replaces affine-map extraction in
    `cvxpygen/solvers/_interface.py` and primal/dual extraction in
    `canonicalizer.py`. It retains solver code generation, settings, update
@@ -221,6 +232,11 @@ class CanonicalMaps:
     total_param_size: int
 
 
+class PrimalTransform(Enum):
+    IDENTITY = "identity"
+    EXP = "exp"
+
+
 @dataclass
 class VarInfo:
     var_id: int
@@ -228,6 +244,7 @@ class VarInfo:
     offset: int
     size: int
     is_symmetric: bool
+    transform: PrimalTransform
 
 
 @dataclass
