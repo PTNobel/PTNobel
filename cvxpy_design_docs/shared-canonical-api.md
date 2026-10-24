@@ -214,12 +214,7 @@ corresponding composed primal indices in `Exp`.
 
 A reduction requiring scaling or addition supplies the sparse
 linear operation for that output. `SolvingChain` composes it with the preceding
-indexing or linear recovery. `ExactCone2Cone` owns PSD dual scaling and recovery
-from auxiliary constraints; attribute reduction supplies primal indexing and
-the output sparsity pattern.
-Recovery from multiple auxiliaries retains all contributing blocks until their
-combination has been composed. `Problem.get_canonical_maps()` returns the
-requested original outputs after chain composition.
+indexing or linear recovery.
 
 ## Constant offsets
 
