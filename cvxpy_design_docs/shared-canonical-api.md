@@ -9,8 +9,8 @@ ChatGPT generated:
 ## Proposal
 
 `Problem.get_canonical_maps()` exposes the sparse affine maps from compiled
-parameters to solver inputs, together with matrices that recover requested
-primal and dual variables. CVXPYgen generates code from these maps; CVXPYlayers
+parameters to solver inputs, together with indexing and linear operations that
+recover requested primal and dual variables. CVXPYgen generates code from these maps; CVXPYlayers
 evaluates them in its tensor framework.
 
 ```python
@@ -21,19 +21,20 @@ canon = problem.get_canonical_maps(
 
 M, v = canon.maps["q"]
 q = M @ param_vec + v
-primal_flat = canon.R_primal @ solver_x
-for info in canon.primal_vars:
-    if info.transform is PrimalTransform.EXP:
-        block = slice(info.offset, info.offset + info.size)
-        primal_flat[block] = np.exp(primal_flat[block])
-dual_flat = canon.R_dual @ solver_y
+recovery = canon.primal_recovery[x.id]
+if isinstance(recovery, Exp):
+    x_flat = np.exp(solver_x[recovery.indices])
+elif isinstance(recovery, np.ndarray):
+    x_flat = solver_x[recovery]
+else:
+    x_flat = recovery @ solver_x  # Linear recovery requiring more than indexing.
+x_value = x_flat.reshape(x.shape, order="F")
 ```
 
 The public method reuses `get_problem_data()` compilation and its reduction
 chain. `variables=None` includes all original variables and explicit constraint
-dual variables. A supplied list limits the recovery rows and accompanying
-metadata to those objects. GP parameter logs use the parameter-transform tags;
-GP primal exponentiation uses the output tags described below.
+dual variables. A supplied list limits recovery and accompanying metadata to those objects. GP parameter logs use the parameter-transform tags;
+GP primal exponentiation uses the recovery objects described below.
 
 ## What the API returns
 
@@ -84,19 +85,27 @@ CVXPYgen traces `param_transforms` and unchanged compiled IDs back to original
 inputs, then combines those dependencies with the nonzero column blocks of
 each `M`. Constant offsets `v` contribute no dependencies.
 
-`R_primal` maps solver primal coordinates to concatenated output blocks.
-Each `VarInfo` identifies the original variable's ID, shape, offset, and an
-`Identity` or `Exp` tag. Callers apply the tag elementwise after the matrix
-multiplication, then reshape the block in Fortran order. Ordinary DCP outputs
-use `Identity`; GP outputs use `Exp` because the matrix recovers log-variable
-values. `Dgp2Dcp` supplies the `Exp` tags for the variables it transforms.
+`canon.primal_recovery[var_id]` is an index array for ordinary indexing or
+`Exp(indices)` for GP recovery. An index array means `solver_x[indices]`;
+`Exp(indices)` means `exp(solver_x[indices])`. Repeated indices express
+expansion, including symmetric primal expansion. Callers reshape each result
+to the original variable's shape in Fortran order. `Dgp2Dcp` supplies `Exp`
+for the log-variables it creates.
 
-`R_dual` recovers concatenated original constraint-dual values.
-`DualInfo` identifies each object in `constraint.dual_variables`, its parent
-constraint ID, shape, and offset; callers reshape slices in Fortran order.
+`canon.dual_recovery[dual_var_id]` similarly indexes the solver dual vector.
+`DualInfo` identifies the parent constraint of each requested dual variable.
 GP duals retain CVXPY's transformed-DCP convention and receive no exponentiation.
-Cone dimensions and constraint ordering accompany the maps so callers can
-construct solver inputs and identify dual blocks.
+The solver interface declares the input vectors' block ordering; Moreau's dual
+vector concatenates slack and direct-cone duals, and ECOS's concatenates equality
+and inequality duals.
+
+An index array cannot express scaling, zero insertion, or sums of contributions.
+For those linear cases, the recovery entry is a sparse matrix applied to the
+same solver vector. Examples include scaled PSD dual unpacking, sparse or diagonal
+primal expansion with explicit zeros, and cone conversions combining auxiliary
+duals. Ordinary indexing stays as an index array. When a consumer needs a sparse
+matrix, it can represent indexing by one unit entry per output row; the
+exponentiation in `Exp` remains separate.
 
 ## Construction
 
@@ -113,18 +122,20 @@ layout before conic map extraction. QP extraction follows `QpSolver.apply()`'s
 signs on its unformatted program. Each matrix-storage conversion transforms the values map and its
 indices together.
 
-`Problem.get_canonical_maps()` constructs recovery of original outputs from the
-solver output layout and the reductions' recovery metadata. It uses the chain's
-existing variable and constraint ID maps to trace requested objects, and composes
-the sparse versions of their slicing, expansion, permutation, and scaling
-operations.
+Each reduction supplies its local recovery alongside its inversion metadata:
+the input blocks it reads and the indices selecting its outputs.
+`SolvingChain` resolves those blocks to solver coordinates and composes indexing
+by substitution: `composed = inner_indices[outer_indices]`. Pass-through blocks
+reuse their indices; repeated indices preserve expansion. `Dgp2Dcp` wraps the
+corresponding composed primal indices in `Exp`.
 
-For example, `ExactCone2Cone` already owns PSD-to-svec conversion and full-matrix
-dual recovery using `SolverInfo`. Its recovery supplies the corresponding block
-of `R_dual`. Symmetric primal expansion comes from attribute lowering and has
-unscaled off-diagonal entries; scaled PSD dual recovery uses `1/sqrt(2)` entries.
-Cone conversions involving auxiliary constraints contribute their dual-recovery
-operators as well as their ID mappings.
+A reduction requiring scaling, zero insertion, or addition supplies the sparse
+linear operation for that output. `SolvingChain` composes it with the preceding
+indexing or linear recovery. `ExactCone2Cone` owns PSD dual scaling and recovery
+from auxiliary constraints; attribute reduction owns primal expansion.
+Recovery from multiple auxiliaries retains all contributing blocks until their
+combination has been composed. `Problem.get_canonical_maps()` returns the
+requested original outputs after chain composition.
 
 ## Constant offsets
 
@@ -156,7 +167,7 @@ and downstream callers.
    per-framework recovery bookkeeping. The returned maps incorporate the signs,
    vector extraction, and storage ordering its adapters currently perform.
    CVXPYlayers retains framework conversion, batching, solver/derivative calls,
-   and evaluates primal output tags. Parameter preprocessing uses the exported tags.
+   and evaluates the returned recovery entries. Parameter preprocessing uses the exported tags.
 3. **CVXPYgen adopts the maps.** It replaces affine-map extraction in
    `cvxpygen/solvers/_interface.py` and primal/dual extraction in
    `canonicalizer.py`. It retains solver code generation, settings, update
@@ -218,8 +229,8 @@ class MatrixStructure:
 class CanonicalMaps:
     maps: dict[str, tuple[scipy.sparse.csr_array, np.ndarray]]
     structures: dict[str, MatrixStructure]
-    R_primal: scipy.sparse.csr_array
-    R_dual: scipy.sparse.csr_array
+    primal_recovery: dict[int, np.ndarray | Exp | scipy.sparse.csr_array]
+    dual_recovery: dict[int, np.ndarray | scipy.sparse.csr_array]
     primal_vars: list[VarInfo]
     dual_vars: list[DualInfo]
     cone_dims: ConeDims
@@ -232,19 +243,17 @@ class CanonicalMaps:
     total_param_size: int
 
 
-class PrimalTransform(Enum):
-    IDENTITY = "identity"
-    EXP = "exp"
+@dataclass
+class Exp:
+    indices: np.ndarray
 
 
 @dataclass
 class VarInfo:
     var_id: int
     shape: tuple[int, ...]
-    offset: int
     size: int
     is_symmetric: bool
-    transform: PrimalTransform
 
 
 @dataclass
@@ -252,7 +261,6 @@ class DualInfo:
     dual_var_id: int
     constraint_id: int
     shape: tuple[int, ...]
-    offset: int
     size: int
     cone_type: str
     is_psd: bool
