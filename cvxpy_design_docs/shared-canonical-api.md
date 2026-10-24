@@ -56,7 +56,6 @@ class CanonicalMaps:
     constraints: list[Constraint]
     parameters: list[Parameter]  # Compiled parameters.
     param_transforms: list[ParameterTransform]  # In execution order.
-    param_id_map: dict[int, list[int]]  # Existing replacement correspondence.
     param_id_to_col: dict[int, int]  # Excludes the constant sentinel.
     param_id_to_size: dict[int, int]
     total_param_size: int
@@ -144,9 +143,6 @@ values evaluate to zero. Keys follow solver names: `c` for SCS/ECOS, `q` for
 Clarabel/OSQP, and `d` for the compiled objective offset. Native bounds have
 their own entries when the solver consumes them.
 
-`canon.param_id_map` also exposes `Chain.compose_param_id_map()`'s replacement
-correspondence. It does not describe every dependency: a GP compilation can
-retain both an original parameter and a new parameter containing its logarithm.
 CVXPYgen traces `param_transforms` and unchanged compiled IDs back to original
 inputs, then combines those dependencies with the nonzero column blocks of
 each `M`. Constant offsets `v` contribute no dependencies.
