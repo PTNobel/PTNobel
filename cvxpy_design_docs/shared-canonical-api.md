@@ -190,13 +190,15 @@ canon = problem.get_canonical_maps(
 
 ## Construction
 
-The compiled program already contains the parameter-to-coefficient tensors.
-CVXPY's shared extraction code splits them into objective, constraint-matrix,
-right-hand-side, and bound maps. The solver's internal `get_canonical_maps()`
-method applies the remaining signs, row splits, and storage conversions used by
-its numerical adapter. SCS and Clarabel share the base conic extraction; ECOS
-splits equality and conic rows; OSQP assembles `A`, `l`, and `u` from the QP
-blocks.
+`Problem.get_canonical_maps()` delegates construction of the solver-input maps
+to the selected solver interface. Each interface provides an internal
+`get_canonical_maps()` method that returns maps in its solver's input format,
+including the input names, signs, row grouping, and matrix storage.
+
+The interfaces use shared extraction code for the parameter-to-coefficient
+tensors in the compiled program. Interfaces with the same input format can
+inherit a common implementation; an interface overrides it where its solver
+requires a different format.
 
 The shared reductions have already applied solver-aware PSD conversion and cone
 layout before conic map extraction. QP extraction follows `QpSolver.apply()`'s
