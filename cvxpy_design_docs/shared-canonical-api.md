@@ -167,9 +167,8 @@ class Exp:
 `DualInfo` identifies the parent constraint of each requested dual variable.
 GP duals retain CVXPY's transformed-DCP convention and receive no exponentiation.
 
-An index array cannot express scaling, zero insertion, or sums of contributions.
-For those linear cases, the recovery entry is a sparse matrix applied to the
-same solver vector. Examples include scaled PSD dual unpacking, sparse or diagonal
+When recovery requires scaling, zero insertion, or sums of contributions, the
+recovery entry is a sparse matrix applied to the same solver vector. Examples include scaled PSD dual unpacking, sparse or diagonal
 primal expansion with explicit zeros, and cone conversions combining auxiliary
 duals. Ordinary indexing stays as an index array. When a consumer needs a sparse
 matrix, it can represent indexing by one unit entry per output row; the
