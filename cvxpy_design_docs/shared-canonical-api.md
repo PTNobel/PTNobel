@@ -50,21 +50,35 @@ The public `param_vec` omits the internal constant sentinel; the exporter puts
 that column in `v`.
 
 These IDs need not be the original parameter IDs. `CvxAttr2Constr` creates fresh
-reduced parameters for sparse, diagonal, and symmetric attributes;
-`Problem.get_canonical_maps()` includes the result of
-`Chain.compose_param_id_map()` as `canon.param_id_map`: original IDs map to lists
-of compiled IDs, and omitted IDs are unchanged.
-The reduction's value transformation determines the entries of each compiled
-block. In particular, sparse parameters contribute their stored entries, without
-densification. The ID correspondence is separate from vector offsets. The
-reductions handle parameter updates and derivatives through `update_parameters()`,
-`param_forward()`, and `param_backward()`.
+reduced parameters for sparse, diagonal, and symmetric attributes.
+`canon.param_transforms` contains the reductions' parameter transformations in
+execution order. Each entry has one `source_id`, one `target_id`, and a tagged
+operation: `Gather(indices)`, `Log`, `Real`, or `Imag`. Multiple entries can
+read the same source; complex splitting uses separate `Real` and `Imag` entries.
 
-CVXPYgen derives its user-parameter-to-solver-input update adjacency from
-`param_id_map` and the nonzero columns of each `M`. The compiled IDs identify
-column blocks through `param_id_to_col` and `param_id_to_size`; CVXPYgen combines
-dependencies across all compiled blocks belonging to an original parameter.
-Constant offsets `v` contribute no dependencies.
+Each reduction supplies its entries alongside the parameters it creates.
+`SolvingChain` concatenates the entries in reduction order, retaining intermediate
+IDs. A consumer starts with original parameter values, evaluates each entry,
+then packs the compiled IDs using `param_id_to_col` and `param_id_to_size`.
+Unchanged IDs use their original values. `Log`, `Real`, and `Imag` act
+elementwise and preserve shape. `Gather` selects a vector from Fortran-flattened
+source values; its indices encode the reduction's existing packing order.
+Sparse sources contain their stored entries in CVXPY's sparse-index order;
+their gathers address those entries without constructing a dense parameter.
+A reduction can emit successive entries when packing follows another operation.
+
+CVXPY's `update_parameters()` evaluates these same entries with NumPy/SciPy.
+CVXPYlayers dispatches the tags to framework operations, retaining autodiff;
+CVXPYgen emits code for the tags it supports. The reductions own the packing
+indices and transformation choices. The existing `param_forward()` and
+`param_backward()` hooks retain their derivative conventions.
+
+`canon.param_id_map` also exposes `Chain.compose_param_id_map()`'s replacement
+correspondence. It does not describe every dependency: a GP compilation can
+retain both an original parameter and a new parameter containing its logarithm.
+CVXPYgen traces `param_transforms` and unchanged compiled IDs back to original
+inputs, then combines those dependencies with the nonzero column blocks of
+each `M`. Constant offsets `v` contribute no dependencies.
 
 `R_primal` and `R_dual` map the solver's primal and dual vectors to concatenated
 original-variable values. `VarInfo` and `DualInfo` identify each output's ID,
@@ -131,7 +145,7 @@ and downstream callers.
    per-framework recovery bookkeeping. The returned maps incorporate the signs,
    vector extraction, and storage ordering its adapters currently perform.
    CVXPYlayers retains framework conversion, batching, solver/derivative calls,
-   and GP transformations.
+   and GP primal exponentiation. Parameter preprocessing uses the exported tags.
 3. **CVXPYgen adopts the maps.** It replaces affine-map extraction in
    `cvxpygen/solvers/_interface.py` and primal/dual extraction in
    `canonicalizer.py`. It retains solver code generation, settings, update
@@ -166,6 +180,21 @@ class Problem:
         ...
 
 
+class ParameterTransformKind(Enum):
+    GATHER = "gather"
+    LOG = "log"
+    REAL = "real"
+    IMAG = "imag"
+
+
+@dataclass
+class ParameterTransform:
+    source_id: int
+    target_id: int
+    kind: ParameterTransformKind
+    indices: np.ndarray | None = None  # Required only for GATHER.
+
+
 @dataclass
 class MatrixStructure:
     format: Literal["csc", "csr"]
@@ -185,7 +214,8 @@ class CanonicalMaps:
     cone_dims: ConeDims
     constraints: list[Constraint]
     parameters: list[Parameter]  # Compiled parameters.
-    param_id_map: dict[int, list[int]]  # Original -> compiled IDs; omitted IDs unchanged.
+    param_transforms: list[ParameterTransform]  # In execution order.
+    param_id_map: dict[int, list[int]]  # Existing replacement correspondence.
     param_id_to_col: dict[int, int]  # Excludes the constant sentinel.
     param_id_to_size: dict[int, int]
     total_param_size: int
