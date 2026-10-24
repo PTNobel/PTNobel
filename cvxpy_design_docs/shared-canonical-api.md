@@ -105,7 +105,9 @@ elementwise and preserve shape. `Gather` selects a vector from Fortran-flattened
 source values; its indices encode the reduction's existing packing order.
 Sparse sources contain their stored entries in CVXPY's sparse-index order;
 their gathers address those entries without constructing a dense parameter.
-A reduction can emit successive entries when packing follows another operation.
+For Hermitian parameters, `Complex2Real` extracts the imaginary part and packs
+its strict upper triangle. The export represents these existing operations as
+successive `Imag` and `Gather` entries.
 
 CVXPY's `update_parameters()` evaluates these same entries with NumPy/SciPy.
 CVXPYlayers dispatches the tags to framework operations, retaining autodiff;
