@@ -8,54 +8,45 @@ ChatGPT generated:
 
 ## Proposal
 
-`Problem.get_canonical_maps()` exposes the sparse affine maps from compiled
-parameters to solver inputs, together with indexing and linear operations that
-recover requested primal and dual variables. CVXPYgen generates code from these maps; CVXPYlayers
-evaluates them in its tensor framework.
+`Problem.get_canonical_maps()` exports the transformations between user
+parameters, solver data, and requested solution values from CVXPY's compiled
+reduction chain. CVXPYgen uses the export to generate code; CVXPYlayers evaluates
+it in its tensor framework.
 
-```python
-canon = problem.get_canonical_maps(
-    solver=cp.CLARABEL,
-    variables=[x, constraint.dual_variables[0]],
-)
+The export has three parts, used in this order:
 
-M, v = canon.maps["q"]
-q = M @ param_vec + v
-recovery = canon.primal_recovery[x.id]
-if isinstance(recovery, Exp):
-    x_flat = np.exp(solver_x[recovery.indices])
-elif isinstance(recovery, np.ndarray):
-    x_flat = solver_x[recovery]
-else:
-    x_flat = recovery @ solver_x  # Linear recovery requiring more than indexing.
-x_value = x_flat.reshape(x.shape, order="F")
-```
+1. **Parameter preparation:** transformations and packing turn user parameter
+   values into the compiled parameter vector.
+2. **Solver inputs:** sparse affine maps turn that vector into the solver's
+   objective coefficients, constraint matrices, right-hand sides, and bounds.
+3. **Solution recovery:** indexing or sparse linear operations recover requested
+   variables and duals from solver outputs. GP primal recovery also applies
+   elementwise exponentiation.
+
+The caller evaluates the first two parts, invokes its solver, then evaluates
+recovery. Solver invocation and differentiation through the solve remain with
+the caller.
 
 The public method reuses `get_problem_data()` compilation and its reduction
 chain. `variables=None` includes all original variables and explicit constraint
-dual variables. A supplied list limits recovery and accompanying metadata to those objects. GP parameter logs use the parameter-transform tags;
-GP primal exponentiation uses the recovery objects described below.
+dual variables. A supplied list limits recovery and accompanying metadata to
+those objects.
 
 ## What the API returns
 
-Each `canon.maps[name]` is an `(M, v)` pair. `M @ param_vec + v` produces a vector
-input or the stored values of a sparse matrix input. `canon.structures[name]`
-provides that matrix's shape, indices, indptr, and CSC/CSR format. The map's row
-order matches the declared storage, including the solver's triangular storage
-when applicable. Structural entries remain present when their values evaluate
-to zero. Keys follow solver names: `c` for SCS/ECOS, `q` for Clarabel/OSQP,
-with `d` for the compiled objective offset. Native bounds have their own entries
-when the solver consumes them.
+### Parameter preparation
 
-The map columns use `ParamConeProg`'s existing parameter coordinates.
+The solver-input maps consume `param_vec`, a vector of compiled parameter values.
+Compiled parameters can have different IDs and shapes from the user's parameters;
+the vector uses `ParamConeProg`'s existing coordinates.
 `parameters`, `param_id_to_col`, `param_id_to_size`, and `total_param_size`
 describe the **compiled** parameters. For compiled parameter `r`, its block
 begins at `param_id_to_col[r.id]` and contains `r.size` entries in Fortran order.
-The public `param_vec` omits the internal constant sentinel; the exporter puts
-that column in `v`.
+The public vector omits the internal constant sentinel; the exporter returns
+its contributions as constant offsets alongside the linear maps.
 
-These IDs need not be the original parameter IDs. `CvxAttr2Constr` creates fresh
-reduced parameters for sparse, diagonal, and symmetric attributes.
+`CvxAttr2Constr` creates fresh reduced parameters for sparse, diagonal, and
+symmetric attributes.
 `canon.param_transforms` contains the reductions' parameter transformations in
 execution order. Each entry has one `source_id`, one `target_id`, and a tagged
 operation: `Gather(indices)`, `Log`, `Real`, or `Imag`. Multiple entries can
@@ -78,12 +69,48 @@ CVXPYgen emits code for the tags it supports. The reductions own the packing
 indices and transformation choices. The existing `param_forward()` and
 `param_backward()` hooks retain their derivative conventions.
 
+### Solver inputs
+
+The prepared vector is `param_vec`. `canon.maps` has one entry per solver input,
+keyed by that input's name. Each entry contains a sparse matrix `M` and a
+constant vector `v`; evaluating `M @ param_vec + v` produces the input.
+
+For example, Clarabel's `q` is the linear objective coefficient vector.
+In the problem below, the only parameter `p` needs no transformation, so
+`param_vec` is simply its flattened value:
+
+```python
+p = cp.Parameter(2, value=np.array([1.0, -2.0]))
+x = cp.Variable(2)
+problem = cp.Problem(cp.Minimize(0.5 * cp.sum_squares(x) + p @ x), [x >= 0])
+canon = problem.get_canonical_maps(solver=cp.CLARABEL, variables=[x])
+
+param_vec = p.value.ravel(order="F")
+M, v = canon.maps["q"]
+q = M @ param_vec + v
+```
+
+For a sparse matrix input, the affine map produces its stored values.
+`canon.structures[name]` supplies the shape, indices, indptr, and CSC/CSR format
+needed to assemble that matrix. Map rows follow that storage order, including
+triangular storage when applicable. Structural entries remain present when their
+values evaluate to zero. Keys follow solver names: `c` for SCS/ECOS, `q` for
+Clarabel/OSQP, and `d` for the compiled objective offset. Native bounds have
+their own entries when the solver consumes them.
+
 `canon.param_id_map` also exposes `Chain.compose_param_id_map()`'s replacement
 correspondence. It does not describe every dependency: a GP compilation can
 retain both an original parameter and a new parameter containing its logarithm.
 CVXPYgen traces `param_transforms` and unchanged compiled IDs back to original
 inputs, then combines those dependencies with the nonzero column blocks of
 each `M`. Constant offsets `v` contribute no dependencies.
+
+### Solution recovery
+
+Recovery reads the solver's primal vector `solver_x` and dual vector `solver_y`.
+The solver interface declares their block ordering: Moreau's dual vector
+concatenates slack and direct-cone duals; ECOS's concatenates equality and
+inequality duals.
 
 `canon.primal_recovery[var_id]` is an index array for ordinary indexing or
 `Exp(indices)` for GP recovery. An index array means `solver_x[indices]`;
@@ -95,9 +122,6 @@ for the log-variables it creates.
 `canon.dual_recovery[dual_var_id]` similarly indexes the solver dual vector.
 `DualInfo` identifies the parent constraint of each requested dual variable.
 GP duals retain CVXPY's transformed-DCP convention and receive no exponentiation.
-The solver interface declares the input vectors' block ordering; Moreau's dual
-vector concatenates slack and direct-cone duals, and ECOS's concatenates equality
-and inequality duals.
 
 An index array cannot express scaling, zero insertion, or sums of contributions.
 For those linear cases, the recovery entry is a sparse matrix applied to the
@@ -119,8 +143,8 @@ blocks.
 
 The shared reductions have already applied solver-aware PSD conversion and cone
 layout before conic map extraction. QP extraction follows `QpSolver.apply()`'s
-signs on its unformatted program. Each matrix-storage conversion transforms the values map and its
-indices together.
+signs on its unformatted program. Each matrix-storage conversion transforms the
+values map and its indices together.
 
 Each reduction supplies its local recovery alongside its inversion metadata:
 the input blocks it reads and the indices selecting its outputs.
@@ -167,7 +191,8 @@ and downstream callers.
    per-framework recovery bookkeeping. The returned maps incorporate the signs,
    vector extraction, and storage ordering its adapters currently perform.
    CVXPYlayers retains framework conversion, batching, solver/derivative calls,
-   and evaluates the returned recovery entries. Parameter preprocessing uses the exported tags.
+   and evaluates the returned recovery entries. Parameter preprocessing uses the
+   exported tags.
 3. **CVXPYgen adopts the maps.** It replaces affine-map extraction in
    `cvxpygen/solvers/_interface.py` and primal/dual extraction in
    `canonicalizer.py`. It retains solver code generation, settings, update
