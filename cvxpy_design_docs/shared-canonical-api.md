@@ -1,5 +1,3 @@
-ChatGPT generated:
-
 # Canonical parameter API
 
 **Status:** Draft · **Updated:** October 23, 2026  
