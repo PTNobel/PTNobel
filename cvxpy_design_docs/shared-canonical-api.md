@@ -153,9 +153,14 @@ inequality duals.
 `canon.primal_recovery[var_id]` is an index array for ordinary indexing or
 `Exp(indices)` for GP recovery. An index array means `solver_x[indices]`;
 `Exp(indices)` means `exp(solver_x[indices])`. Repeated indices express
-expansion, including symmetric primal expansion. Callers reshape each result
-to the original variable's shape in Fortran order. `Dgp2Dcp` supplies `Exp`
+expansion, including symmetric primal expansion. `Dgp2Dcp` supplies `Exp`
 for the log-variables it creates.
+
+`VarInfo.shape` gives the original variable's logical shape. Dense outputs are
+reshaped in Fortran order. Sparse outputs contain only their stored values;
+`VarInfo.sparse_idx` gives the corresponding coordinates in that shape.
+Diagonal outputs contain only their diagonal entries, with diagonal coordinates
+in `sparse_idx`.
 
 ```python
 @dataclass
@@ -167,12 +172,9 @@ class Exp:
 `DualInfo` identifies the parent constraint of each requested dual variable.
 GP duals retain CVXPY's transformed-DCP convention and receive no exponentiation.
 
-When recovery requires scaling, zero insertion, or sums of contributions, the
-recovery entry is a sparse matrix applied to the same solver vector. Examples include scaled PSD dual unpacking, sparse or diagonal
-primal expansion with explicit zeros, and cone conversions combining auxiliary
-duals. Ordinary indexing stays as an index array. When a consumer needs a sparse
-matrix, it can represent indexing by one unit entry per output row; the
-exponentiation in `Exp` remains separate.
+When recovery requires scaling or sums of contributions, the recovery entry is
+a sparse matrix applied to the solver vector. Examples include scaled PSD dual
+unpacking and cone conversions combining auxiliary duals.
 
 The `variables` argument selects which original outputs receive recovery entries.
 Its elements are primal variable objects, such as `x`, or dual variable objects,
@@ -211,10 +213,11 @@ by substitution: `composed = inner_indices[outer_indices]`. Pass-through blocks
 reuse their indices; repeated indices preserve expansion. `Dgp2Dcp` wraps the
 corresponding composed primal indices in `Exp`.
 
-A reduction requiring scaling, zero insertion, or addition supplies the sparse
+A reduction requiring scaling or addition supplies the sparse
 linear operation for that output. `SolvingChain` composes it with the preceding
 indexing or linear recovery. `ExactCone2Cone` owns PSD dual scaling and recovery
-from auxiliary constraints; attribute reduction owns primal expansion.
+from auxiliary constraints; attribute reduction supplies primal indexing and
+the output sparsity pattern.
 Recovery from multiple auxiliaries retains all contributing blocks until their
 combination has been composed. `Problem.get_canonical_maps()` returns the
 requested original outputs after chain composition.
@@ -288,8 +291,9 @@ class MatrixStructure:
 @dataclass
 class VarInfo:
     var_id: int
-    shape: tuple[int, ...]
-    size: int
+    shape: tuple[int, ...]  # Logical shape.
+    size: int  # Number of recovered entries.
+    sparse_idx: tuple[np.ndarray, ...] | None  # None for dense outputs.
     is_symmetric: bool
 
 
