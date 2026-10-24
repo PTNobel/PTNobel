@@ -138,8 +138,8 @@ q = M @ param_vec + v
 
 For a sparse matrix input, the affine map produces its stored values.
 `canon.structures[name]` supplies the shape, indices, indptr, and CSC/CSR format
-needed to assemble that matrix. Map rows follow that storage order, including
-triangular storage when applicable. Structural entries remain present when their
+needed to assemble that matrix. If the solver accepts only one triangle of a symmetric
+matrix, the map produces only that triangle's stored entries. Structural entries remain present when their
 values evaluate to zero. Keys follow solver names: `c` for SCS/ECOS, `q` for
 Clarabel/OSQP, and `d` for the compiled objective offset. Native bounds have
 their own entries when the solver consumes them.
