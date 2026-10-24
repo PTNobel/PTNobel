@@ -14,6 +14,7 @@ class Problem:
         self, solver: str, variables: list[Variable] | None = None,
         *, gp: bool = False, **compilation_options,
     ) -> CanonicalMaps:
+        """variables=None selects all original primals and problem.constraints duals."""
         ...
 ```
 
@@ -186,10 +187,6 @@ canon = problem.get_canonical_maps(
     variables=[x, constraint.dual_variables[0]],
 )
 ```
-
-With `variables=None`, the export includes all original primal variables and
-the dual variables of constraints in `problem.constraints`. A supplied list
-limits recovery entries and their metadata to the selected objects.
 
 ## Construction
 
