@@ -236,26 +236,8 @@ that sentinel or the interface's maps with the compilation:
 CVXPY's solve path, CVXPYgen, and CVXPYlayers use each converted interface's
 map construction.
 
-### Migration plan
-
-1. **CVXPY adds the API.** The base conic implementation covers SCS/Clarabel;
-   OSQP and ECOS supply their splitting and storage adaptations. CVXPY tests
-   compare map evaluation with the existing numerical adapter inputs and compare
-   recovery with the reduction chain's recovery.
-2. **CVXPYlayers adopts the maps.** It replaces direct reduced-tensor access and
-   per-framework recovery bookkeeping. The returned maps incorporate the signs,
-   vector extraction, and storage ordering its adapters currently perform.
-   CVXPYlayers retains framework conversion, batching, solver/derivative calls,
-   and evaluates the returned recovery entries. Parameter preprocessing uses the
-   exported tags.
-3. **CVXPYgen adopts the maps.** It replaces affine-map extraction in
-   `cvxpygen/solvers/_interface.py` and primal/dual extraction in
-   `canonicalizer.py`. It retains solver code generation, settings, update
-   adjacency, and derivative machinery.
-4. **CVXPY deprecates downstream reliance on internal tensors.** After both
-   libraries have migrated, CVXPY documents `reduced_A.reduced_mat`, `q`, and
-   related tensor/layout access as implementation details and directs downstream
-   callers to `get_canonical_maps()`.
+After CVXPYgen and CVXPYlayers have migrated, CVXPY can deprecate their reliance
+on internal tensors such as `reduced_A.reduced_mat` and direct `q` access.
 
 ## Open questions
 
