@@ -8,6 +8,15 @@ ChatGPT generated:
 
 ## Proposal
 
+```python
+class Problem:
+    def get_canonical_maps(
+        self, solver: str, variables: list[Variable] | None = None,
+        *, gp: bool = False, **compilation_options,
+    ) -> CanonicalMaps:
+        ...
+```
+
 `Problem.get_canonical_maps()` exports the transformations between user
 parameters, solver data, and requested solution values from CVXPY's compiled
 reduction chain. CVXPYgen uses the export to generate code; CVXPYlayers evaluates
@@ -49,6 +58,22 @@ symmetric attributes.
 execution order. Each entry has one `source_id`, one `target_id`, and a tagged
 operation: `Gather(indices)`, `Log`, `Real`, or `Imag`. Multiple entries can
 read the same source; complex splitting uses separate `Real` and `Imag` entries.
+
+```python
+class ParameterTransformKind(Enum):
+    GATHER = "gather"
+    LOG = "log"
+    REAL = "real"
+    IMAG = "imag"
+
+
+@dataclass
+class ParameterTransform:
+    source_id: int
+    target_id: int
+    kind: ParameterTransformKind
+    indices: np.ndarray | None = None  # Required only for GATHER.
+```
 
 Each reduction supplies its entries alongside the parameters it creates.
 `SolvingChain` concatenates the entries in reduction order, retaining intermediate
@@ -116,6 +141,12 @@ inequality duals.
 expansion, including symmetric primal expansion. Callers reshape each result
 to the original variable's shape in Fortran order. `Dgp2Dcp` supplies `Exp`
 for the log-variables it creates.
+
+```python
+@dataclass
+class Exp:
+    indices: np.ndarray
+```
 
 `canon.dual_recovery[dual_var_id]` similarly indexes the solver dual vector.
 `DualInfo` identifies the parent constraint of each requested dual variable.
@@ -232,29 +263,6 @@ and downstream callers.
 ## Appendix: API sketch
 
 ```python
-class Problem:
-    def get_canonical_maps(
-        self, solver: str, variables: list[Variable] | None = None,
-        *, gp: bool = False, **compilation_options,
-    ) -> CanonicalMaps:
-        ...
-
-
-class ParameterTransformKind(Enum):
-    GATHER = "gather"
-    LOG = "log"
-    REAL = "real"
-    IMAG = "imag"
-
-
-@dataclass
-class ParameterTransform:
-    source_id: int
-    target_id: int
-    kind: ParameterTransformKind
-    indices: np.ndarray | None = None  # Required only for GATHER.
-
-
 @dataclass
 class MatrixStructure:
     format: Literal["csc", "csr"]
@@ -279,11 +287,6 @@ class CanonicalMaps:
     param_id_to_col: dict[int, int]  # Excludes the constant sentinel.
     param_id_to_size: dict[int, int]
     total_param_size: int
-
-
-@dataclass
-class Exp:
-    indices: np.ndarray
 
 
 @dataclass
