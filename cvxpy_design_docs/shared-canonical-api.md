@@ -143,9 +143,11 @@ values evaluate to zero. Keys follow solver names: `c` for SCS/ECOS, `q` for
 Clarabel/OSQP, and `d` for the compiled objective offset. Native bounds have
 their own entries when the solver consumes them.
 
-CVXPYgen traces `param_transforms` and unchanged compiled IDs back to original
-inputs, then combines those dependencies with the nonzero column blocks of
-each `M`. Constant offsets `v` contribute no dependencies.
+CVXPYgen needs to know which solver inputs to update when a user parameter
+changes. For each user parameter, it follows `param_transforms` to identify the
+compiled parameter values that change, including the original parameter if it
+survives compilation. A solver input needs updating if its matrix `M` has a
+nonzero column for any of those values.
 
 ### Solution recovery
 
